@@ -1,0 +1,20 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# VS Code
+.vscode/
+
+# Generated artifacts / local state
+embeddings/
+vector_store/
+
+# Source PDFs (keep out of git by default)
+docs/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db

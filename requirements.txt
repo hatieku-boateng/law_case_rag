@@ -1,0 +1,10 @@
+openai
+numpy
+pandas
+matplotlib
+streamlit==1.53.0
+altair>=5,<6
+scikit-learn
+python-dotenv
+PyPDF2
+pyarrow
