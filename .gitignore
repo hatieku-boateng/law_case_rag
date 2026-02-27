@@ -18,3 +18,6 @@ docs/*.pdf
 # OS
 .DS_Store
 Thumbs.db
+
+# Git Credential Manager diagnostics
+gcm-diagnose.log
