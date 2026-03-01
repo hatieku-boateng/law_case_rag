@@ -79,48 +79,39 @@ def _find_vector_store_id_by_name(client: OpenAI, name: str) -> Optional[str]:
     return None
 
 
-@st.cache_data(ttl=300)
-def _case_label_from_local_pdf(filename: str) -> Optional[str]:
-    pdf_path = os.path.join("docs", filename)
-    if not os.path.isfile(pdf_path):
+@st.cache_data(ttl=3600)
+def _fetch_case_title_from_vs(api_key: str, vector_store_id: str, filename: str) -> Optional[str]:
+    """Ask the vector store for the exact case title of the given document."""
+    if not api_key or not vector_store_id or not filename:
         return None
-
     try:
-        from PyPDF2 import PdfReader  # type: ignore
+        client = OpenAI(api_key=api_key)
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            instructions=(
+                "You are a legal document assistant. "
+                "Retrieve the exact case name/title as it appears on the first page of the document. "
+                "Return ONLY the case name, nothing else. "
+                "If you cannot find it, return the filename."
+            ),
+            input=f"What is the exact case name or title in the document '{filename}'? Return only the case name.",
+            tools=[{"type": "file_search", "vector_store_ids": [vector_store_id], "max_num_results": 5}],
+            temperature=0,
+        )
+        title = (resp.output_text or "").strip()
+        return title if title else None
     except Exception:
         return None
 
-    try:
-        reader = PdfReader(pdf_path)
-        if not reader.pages:
-            return None
-        text = (reader.pages[0].extract_text() or "").strip()
-    except Exception:
-        return None
 
-    if not text:
-        return None
-
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        return None
-
-    # Heuristic: prefer a line that looks like a case caption.
-    keywords = (" v ", " v. ", " vs ", " vs. ", " vrs ", " vrs. ")
-    for ln in lines[:40]:
-        low = f" {ln.lower()} "
-        if any(k in low for k in keywords):
-            return ln
-
-    # Fallback: use the first meaningful line.
-    return lines[0]
-
-
-def _display_case_label(filename: str) -> str:
+def _display_case_label(filename: str, api_key: str = "", vector_store_id: str = "") -> str:
     if filename == "(All cases)":
         return filename
-    label = _case_label_from_local_pdf(filename)
-    return label or filename
+    if api_key and vector_store_id:
+        title = _fetch_case_title_from_vs(api_key, vector_store_id, filename)
+        if title:
+            return title
+    return filename
 
 
 @st.cache_data(ttl=300)
@@ -240,7 +231,7 @@ def main() -> None:
             "Focused case",
             dropdown,
             key="selected_case",
-            format_func=_display_case_label,
+            format_func=lambda fn: _display_case_label(fn, api_key, vector_store_id or ""),
         )
 
         if st.button("New chat"):
@@ -249,7 +240,7 @@ def main() -> None:
 
     selected_case = (st.session_state.get("selected_case") or "").strip()
     if selected_case and selected_case != "(All cases)":
-        st.info(f"**Focused Case:** {_display_case_label(selected_case)}")
+        st.info(f"**Focused Case:** {_display_case_label(selected_case, api_key, vector_store_id or '')}")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -275,7 +266,7 @@ def main() -> None:
     system += f"\n\nPractice area: {practice_area}" if practice_area else ""
     system += f"\nJurisdiction: {jurisdiction}" if jurisdiction else ""
 
-    case_label = _display_case_label(selected_case) if selected_case and selected_case != "(All cases)" else ""
+    case_label = _display_case_label(selected_case, api_key, vector_store_id or "") if selected_case and selected_case != "(All cases)" else ""
     if case_label:
         system += (
             "\n\nFOCUS CASE:\n"
@@ -339,7 +330,7 @@ def main() -> None:
                     try:
                         fobj = client.files.retrieve(fid)
                         fn = (getattr(fobj, "filename", "") or "").strip()
-                        file_id_to_name[fid] = _display_case_label(fn) if fn else fid
+                        file_id_to_name[fid] = _display_case_label(fn, api_key, vector_store_id or "") if fn else fid
                     except Exception:
                         file_id_to_name[fid] = fid
 
