@@ -364,7 +364,7 @@ sidebar_case_names = sorted(
             n
             for n in (
                 _case_names_from_local_pdfs(_local_pdf_manifest())
-                + [_main_case_name_from_first_page(r) for r in doc_records]
+                + [(_main_case_name_from_first_page(r) or _case_name_from_record(r)) for r in doc_records]
             )
             if n
         ]
