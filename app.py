@@ -42,6 +42,64 @@ MODEL = "gpt-4o"
 VECTOR_STORE_NAME = "supreme court cases"
 
 
+BASE_SYSTEM_PROMPT = """
+You are The Law Student Assistant: a legal research assistant specialised in analysing Supreme Court case law
+ONLY from the documents available in the vector store and/or retrieved excerpts.
+
+NON-NEGOTIABLE GROUNDING RULE:
+- Use ONLY the text you retrieve from the uploaded rulings/metadata.
+- Do NOT use general legal knowledge, memory, or assumptions.
+- If the retrieved text does not contain an answer, say: "Not found in retrieved text." and ask a targeted follow-up.
+
+RETRIEVAL WORKFLOW (FOLLOW THIS ORDER):
+1) Retrieve: search for the most relevant excerpts first (especially headings like JUDGMENT/JUDGEMENT/RULING/OPINION and the judge surname + "JSC").
+    If the user asks for submissions/opinions/votes per judge, you MUST repeat retrieval per judge (one judge at a time) until you either find a quote for that judge or you conclude it is not present in retrieved text.
+2) Verify: before you claim anything (submission/vote/outcome), confirm the exact wording exists in the retrieved text.
+3) Quote: when you present a per-judge submission/opinion/conclusion/vote, include at least one direct quote copied verbatim.
+4) If you cannot quote it verbatim, you must write: "Not found in retrieved text." (no paraphrase, no guessing).
+
+CASE NAME + CORAM RULE (FIRST PAGE):
+- The case name and Coram (judges) usually appear on page 1.
+- Do NOT treat Coram, case caption, or front-matter as a judge's submission/reasoning.
+
+JUDGE ATTRIBUTION SAFETY:
+- Only attribute text to a judge if it appears inside that judge’s own opinion/judgment section.
+- Do NOT misattribute citations like "opinion of Justice X in another case" as Justice X’s submission in the current case.
+- Ignore role markers like "(PRESIDING)" for submissions; those are not reasoning.
+
+VOTES / OUTCOME SAFETY:
+- Do NOT infer "dismissed/allowed/unanimous" unless the retrieved text explicitly states it and you can quote it.
+- Do NOT infer how each judge voted unless the retrieved text explicitly indicates concurrence/dissent/allow/dismiss (quote required).
+
+MANDATORY PER-JUDGE COVERAGE:
+- If you have a Coram list (judges who sat), you MUST produce a per-judge entry for EVERY judge in the Coram whenever the user asks about submissions/opinions/reasoning/conclusions/votes.
+- For each judge, output either (a) a direct quote showing that judge's submission/opinion/reasoning, or (b) "Not found in retrieved text.".
+- Do not skip judges.
+
+RESPONSE FORMAT (USE THIS STRUCTURE WHEN APPLICABLE):
+
+Case: [Exact case name as it appears on page 1 (or AVAILABLE CASES list)]
+
+Coram (from page 1 if available):
+- [Judge 1]
+- ...
+
+Per-Judge Analysis (evidence-only):
+- Judge [Name] (repeat for every Coram judge):
+    - Submission/Reasoning (quote): "..." OR Not found in retrieved text.
+    - Conclusion/Vote (quote): "..." OR Not found in retrieved text.
+
+Decision Outcome (evidence-only):
+- "..." OR Not found in retrieved text.
+
+Participation Notes (if stated):
+- "..." OR Not found in retrieved text.
+
+If the user asks for legal advice:
+- Provide general information only from retrieved case law and state it is not legal advice.
+""".strip()
+
+
 def _load_vector_store_record() -> Optional[dict[str, Any]]:
     paths = [
         os.path.join("embeddings", "vector_store.supreme-court-cases.json"),
@@ -383,6 +441,25 @@ def _is_vote_query(text: str) -> bool:
     return re.search(pattern, t) is not None
 
 
+def _is_judicial_breakdown_query(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    if _is_vote_query(t):
+        return True
+
+    # Queries asking for per-judge submissions/opinions/reasoning/conclusions.
+    pattern = (
+        r"\b(each|every|all)\s+judge\b"
+        r"|\bjudges\s+who\s+sat\b"
+        r"|\bper\s+judge\b"
+        r"|\bcoram\b"
+        r"|\b(submission|submissions|opinion|opinions|reasoning|conclusion|conclusions)\b"
+    )
+    return re.search(pattern, t) is not None
+
+
 def _best_local_pdf_for_case(selected_case: str) -> Optional[Path]:
     """Best-effort mapping from a selected case name to a local PDF."""
     want = (selected_case or "").strip().lower()
@@ -558,32 +635,76 @@ def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str
         # Fallback: take the first substantial excerpt beyond any short heading.
         return w2_one[:700].strip()
 
-    results: dict[str, dict[str, str]] = {}
+    results = {}
+    text_len = len(text)
+    
+    headings = []
+    # General strategy to find sections belonging to a judge 
+    # Matches patterns like "JUSTICE SMITH JSC:", "SMITH JSC", "SMITH, JSC", "OPINION OF SMITH, JSC"
+    for j in judges:
+        j_n = re.sub(r"\s+", " ", j).strip()
+        surname = re.split(r"[,\s]", j_n, maxsplit=1)[0]
+        surname = re.sub(r"[^A-Za-z\-']", "", surname)
+        
+        # Broad lookup looking for surname + Judicial Title
+        pat = r"(?im)^.{0,30}" + re.escape(surname) + r".{0,40}?(?:JSC|J\.S\.C|CJ|AG\.?\s*CJ|JA)\b.{0,30}$"
+        hits = []
+        for m in re.finditer(pat, text):
+            if m.start() > 2500:  # Skip coram/front matter, usually on page 1-2
+                hits.append(m.start())
+        if hits:
+            # We take the first hit that occurs after title pages
+            headings.append((hits[0], j))
+            
+    headings.sort(key=lambda x: x[0])
 
-    if headings:
-        for idx, (s, e, judge) in enumerate(headings):
-            end = headings[idx + 1][0] if idx + 1 < len(headings) else min(len(text), s + 20000)
-            segment = text[s:end]
-            window = segment[:12000]
-            m = re.search(
-                r"(.{0,120}?(?:dissent(ing)?|concurring|concur|I\s+would\s+dismiss|I\s+would\s+allow|appeal\s+is\s+dismissed|appeal\s+is\s+allowed).{0,160})",
-                window,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            snippet = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
-            vote, vote_ev = _classify(snippet)
+    for idx, (s, judge) in enumerate(headings):
+        nxt = headings[idx+1][0] if idx + 1 < len(headings) else text_len
+        section = text[s:nxt]
+        
+        vote = ""
+        vote_ev = ""
+        
+        # Look for explicit concluding language
+        m_dismiss = re.search(r"\b(I\s+(?:would|therefore)?\s*dismiss|petition\s+is\s+(?:hereby\s+)?dismissed|appeal\s+is\s+(?:hereby\s+)?dismissed)\b", section, re.I)
+        m_allow = re.search(r"\b(I\s+(?:would|therefore)?\s*allow|petition\s+is\s+(?:hereby\s+)?allowed|appeal\s+is\s+(?:hereby\s+)?allowed)\b", section, re.I)
+        
+        if m_dismiss and m_allow:
+            vote = "Mixed opinion (mentions both dismiss and allow)"
+            start_ev = max(0, m_dismiss.start()-50)
+            end_ev = min(len(section), m_dismiss.end()+50)
+            vote_ev = section[start_ev:end_ev].replace('\n',' ')
+        elif m_dismiss:
+            vote = "Supports dismissal"
+            start_ev = max(0, m_dismiss.start()-50)
+            end_ev = min(len(section), m_dismiss.end()+50)
+            vote_ev = section[start_ev:end_ev].replace('\n',' ')
+        elif m_allow:
+            vote = "Supports allowing"
+            start_ev = max(0, m_allow.start()-50)
+            end_ev = min(len(section), m_allow.end()+50)
+            vote_ev = section[start_ev:end_ev].replace('\n',' ')
+        else:
+            m_concur = re.search(r"\b(I\s+(?:fully\s+)?(?:agree|concur)\s+with)\b", section, re.I)
+            if m_concur:
+                vote = "Concurring"
+                start_ev = max(0, m_concur.start()-30)
+                end_ev = min(len(section), m_concur.end()+80)
+                vote_ev = section[start_ev:end_ev].replace('\n',' ')
 
-            after_heading = segment[max(0, e - s) : max(0, e - s) + 6000]
-            submission = _extract_submission(after_heading)
-
-            out: dict[str, str] = {}
-            if vote and vote_ev:
-                out["vote"] = vote
-                out["vote_evidence"] = vote_ev
-            if submission:
-                out["submission_extract"] = submission
-            if out:
-                results[judge] = out
+        # Grab qualitative substring. Skip possible empty line directly under heading
+        start_idx = section.find("\n")
+        if start_idx == -1: start_idx = 0
+        
+        # We look around 1200 chars to form a good abstract of the opinion
+        sub_text = section[start_idx:start_idx+1200].replace('\n', ' ')
+        sub_text = re.sub(r"\s+", " ", sub_text).strip()
+        
+        results[judge] = {
+            "vote": vote,
+            "vote_evidence": vote_ev.strip(),
+            "submission_extract": sub_text
+        }
 
     return results
 
@@ -745,85 +866,7 @@ if prompt:
     if selected_case and selected_case != "(All cases)":
         intake_bits.append(f"Selected case (user focus): {selected_case}")
 
-    system = """
-You are a legal research assistant specialised in analysing Supreme Court case law
-from the documents available in the vector store.
-
-Legal cases must be interpreted technically. Therefore, your responses must reflect
-the judicial structure of the decision-making process where available in the
-retrieved documents.
-
-Your task is to answer questions ONLY using retrieved information from the uploaded
-Supreme Court rulings and their metadata.
-
-RESPONSE RULES:
-
-1. Ground all answers strictly in retrieved case law content.
-    Do NOT rely on general legal knowledge or assumptions.
-
-2. Where applicable, your analysis MUST extract and present (ONLY if available in the retrieved documents):
-    a. The judges who sat on the case (Coram)
-    b. Each judge’s opinion or submission
-    c. The conclusion reached by each judge
-    d. How each judge voted (Majority / Concurring / Dissenting)
-    e. Whether any judge abstained, did not participate, or recused themselves
-    If any of the above is not available in the retrieved material, say so explicitly and do not guess.
-
-    IMPORTANT:
-    - The case name and the Coram (judges) usually appear on the first page.
-    - The judges’ opinions/reasoning, votes, and the decision outcome usually appear later in the document.
-    - Therefore, you MUST scan the retrieved text from across the document to extract opinions/votes/outcome.
-
-3. When referencing a case, always structure your response as (where applicable):
-
-    Case: [Case Name]
-
-    Coram:
-    [List of judges retrieved from the ruling]
-
-    Judicial Opinions:
-    - Judge [Name]:
-         Position:
-         Reasoning:
-         Conclusion/Vote:
-
-    Decision Outcome:
-    [Majority holding based ONLY on retrieved content]
-
-    Participation Notes (if applicable):
-    [Abstentions / Non-participation / Recusal]
-
-    Source:
-    Retrieved Supreme Court Ruling
-
-4. If no relevant information is retrieved from the vector store:
-    Clearly state: "No relevant Supreme Court ruling was found in the uploaded documents."
-    Then ask a clarifying question to improve retrieval.
-
-5. If the user asks for legal advice:
-    Provide general legal information from retrieved case law only.
-    Clearly state that this is not legal advice.
-    Suggest consulting a qualified legal practitioner.
-
-6. If the user asks:
-    "What cases do you have?"
-    Respond ONLY with the names of the available cases based on file metadata.
-    Do NOT summarise or describe them.
-    Treat the following as the same request and respond the same way:
-    - "What are the main cases?"
-    - "List the available cases"
-    - "Which cases are in the vector store / uploaded documents?"
-
-7. Do NOT fabricate:
-    - case names
-    - judges
-    - judicial opinions
-    - votes
-    - legal principles
-    - abstentions or participation status
-
-8. Your training knowledge must not be used unless it appears in the retrieved documents.
-""".strip()
+    system = BASE_SYSTEM_PROMPT
     if intake_bits:
         system += "\n\n" + "\n".join(intake_bits)
 
@@ -885,78 +928,77 @@ RESPONSE RULES:
     if judges_lines:
         system += "\n\nJUDGES (from first page):\n" + "\n".join(judges_lines)
 
-    # Deterministic handling: vote questions are prone to hallucination if retrieval doesn't
-    # include explicit vote wording. For these queries, extract evidence directly from the PDF
-    # text and only report what is explicitly found.
-    if _is_vote_query(prompt):
+    # Deterministic handling for judicial breakdown queries (submissions/votes by judge).
+    # Retrieval can miss opinion sections; for these queries we scan the selected local PDF
+    # and return quote-backed per-judge entries for ALL judges in Coram.
+    if _is_judicial_breakdown_query(prompt):
         target_case = selected_case if (selected_case and selected_case != "(All cases)") else ""
         pdf_path = _best_local_pdf_for_case(target_case) if target_case else None
 
         if pdf_path is None:
-            # If no explicit case selected, fall back to first local PDF (prototype-friendly).
             local_pdfs = _discover_local_pdfs()
             pdf_path = local_pdfs[0] if local_pdfs else None
 
-        if pdf_path is None:
-            answer = (
-                "No local PDF is available to scan for judge votes on this deployment. "
-                "Ensure the ruling PDF is present under the `docs/` folder."
-            )
+        if pdf_path is not None:
+            try:
+                st_ = pdf_path.stat()
+                sig = f"{st_.st_size}:{st_.st_mtime_ns}"
+            except Exception:
+                sig = ""
+
+            first_page = _extract_first_page_text(str(pdf_path), doc_sha256=sig)
+            case_name = _case_name_from_first_page_text(first_page) or pdf_path.name
+            coram = _judges_from_first_page_text(first_page)
+            full_text = _extract_full_pdf_text(str(pdf_path), doc_sha256=sig)
+            per_judge = _extract_votes_from_full_text(full_text, coram)
+
+            lines: list[str] = []
+            lines.append(f"Case: {case_name}")
+            lines.append("")
+            lines.append("Coram (from first page):")
+            if coram:
+                lines.extend([f"- {j}" for j in coram])
+            else:
+                lines.append("- Not found in retrieved text.")
+
+            lines.append("")
+            lines.append("Per-Judge Analysis (evidence-only):")
+
+            if coram:
+                for j in coram:
+                    info = per_judge.get(j, {})
+                    submission = (info.get("submission_extract") or "").strip()
+                    vote = (info.get("vote") or "").strip()
+                    vote_ev = (info.get("vote_evidence") or "").strip()
+
+                    lines.append(f"- **Judge {j}**:")
+                    if submission:
+                        # Clean up formatting for display
+                        clean_sub = re.sub(r'\s+', ' ', submission)
+                        lines.append(f"  - **Submission/Reasoning (quote)**: \"{clean_sub}...\"")
+                    else:
+                        lines.append("  - **Submission/Reasoning (quote)**: Not clearly extracted. Please verify in the full document.")
+
+                    if vote and vote_ev:
+                        lines.append(f"  - **Conclusion/Vote**: {vote}")
+                        clean_ev = re.sub(r'\s+', ' ', vote_ev)
+                        lines.append(f"  - **Vote Evidence (quote)**: \"{clean_ev}\"")
+                    elif vote:
+                        lines.append(f"  - **Conclusion/Vote**: {vote}")
+                    else:
+                        lines.append("  - **Conclusion/Vote**: Not explicitly matched by heuristic keywords (check submission text).")
+            else:
+                lines.append("- Unable to build per-judge breakdown because Coram was not found on page 1.")
+
+            lines.append("")
+            lines.append("Decision Outcome (evidence-only):")
+            lines.append("- Not found in retrieved text.")
+
+            answer = "\n".join(lines)
             with st.chat_message("assistant"):
                 st.markdown(answer)
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.stop()
-
-        try:
-            st_ = pdf_path.stat()
-            sig = f"{st_.st_size}:{st_.st_mtime_ns}"
-        except Exception:
-            sig = ""
-
-        first_page = _extract_first_page_text(str(pdf_path), doc_sha256=sig)
-        case_name = _case_name_from_first_page_text(first_page) or pdf_path.name
-        coram = _judges_from_first_page_text(first_page)
-        full_text = _extract_full_pdf_text(str(pdf_path), doc_sha256=sig)
-        per_judge = _extract_votes_from_full_text(full_text, coram)
-
-        lines: list[str] = []
-        lines.append(f"Case: {case_name}")
-        lines.append("")
-        lines.append("Coram:")
-        if coram:
-            lines.extend([f"- {j}" for j in coram])
-        else:
-            lines.append("(Coram not found on the first page text.)")
-        lines.append("")
-        lines.append("Judicial Opinions / Votes (evidence-based extracts):")
-        if per_judge:
-            for j in coram:
-                info = per_judge.get(j)
-                if not info:
-                    lines.append(f"- Judge {j}: Vote not explicitly found in extractable text.")
-                    continue
-                lines.append(f"- Judge {j}:")
-                if info.get("vote"):
-                    lines.append(f"  Conclusion/Vote: {info.get('vote','')}")
-                    lines.append(f"  Vote Evidence: “{info.get('vote_evidence','')}”")
-                else:
-                    lines.append("  Conclusion/Vote: (Not explicitly found in extractable text.)")
-
-                if info.get("submission_extract"):
-                    lines.append(f"  Submission (extract): “{info.get('submission_extract','')}”")
-                else:
-                    lines.append("  Submission (extract): (Not located in the extractable text window for this judge.)")
-        else:
-            lines.append(
-                "No explicit vote wording could be located in the extractable text returned from this PDF. "
-                "If you want, ask a narrower question (e.g., 'quote where [Judge] states whether they dissent/agree') "
-                "or ensure the vector-store retrieval is returning the opinion sections."
-            )
-        answer = "\n".join(lines)
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-        st.stop()
 
     # Deterministic handling: deployed models can occasionally drift on instruction-following.
     # For case-list queries, return the first-page-derived case names directly.
