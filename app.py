@@ -118,11 +118,7 @@ with st.sidebar:
     practice_area = st.selectbox(
         "Practice area",
         [
-            "General",
-            "Corporate",
-            "Litigation",
-            "Employment",
-            "Real Estate",
+            
             "Supreme Court",
         ],
         index=0,
