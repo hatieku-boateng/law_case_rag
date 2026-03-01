@@ -978,26 +978,53 @@ if prompt:
                     if submission:
                         # Clean up formatting for display
                         clean_sub = re.sub(r'\s+', ' ', submission)
-                        lines.append(f"  - **Submission/Reasoning (quote)**: \"{clean_sub}...\"")
+                        lines.append(f"  - **Submission/Reasoning**: {clean_sub}")
                     else:
-                        lines.append("  - **Submission/Reasoning (quote)**: Not clearly extracted. Please verify in the full document.")
+                        lines.append("  - **Submission/Reasoning**: Not clearly extracted. Please verify in the full document.")
 
                     if vote and vote_ev:
                         lines.append(f"  - **Conclusion/Vote**: {vote}")
                         clean_ev = re.sub(r'\s+', ' ', vote_ev)
-                        lines.append(f"  - **Vote Evidence (quote)**: \"{clean_ev}\"")
+                        lines.append(f"  - **Vote Evidence**: \"{clean_ev}\"")
                     elif vote:
                         lines.append(f"  - **Conclusion/Vote**: {vote}")
                     else:
-                        lines.append("  - **Conclusion/Vote**: Not explicitly matched by heuristic keywords (check submission text).")
+                        lines.append("  - **Conclusion/Vote**: Not explicitly matched by heuristic keywords.")
             else:
                 lines.append("- Unable to build per-judge breakdown because Coram was not found on page 1.")
 
             lines.append("")
-            lines.append("Decision Outcome (evidence-only):")
+            lines.append("Decision Outcome:")
             lines.append("- Not found in retrieved text.")
 
-            answer = "\n".join(lines)
+            raw_answer = "\n".join(lines)
+            answer = raw_answer
+
+            # Use LLM to summarize the extracted text into very brief key points
+            if client is not None:
+                try:
+                    summary_prompt = (
+                        "You are a dedicated legal assistant summarising judge submissions. "
+                        "Below is raw extracted text containing each judge's submission and exact vote. "
+                        "The user requested a very brief summary.\n\n"
+                        "Instructions:\n"
+                        "1. Provide a well-formatted per-judge breakdown.\n"
+                        "2. For their 'Submission/Reasoning', concisely highlight the very key points in 1-3 short sentences. Do not hallucinate external facts.\n"
+                        "3. Preserve their exact 'Conclusion/Vote' status.\n\n"
+                        f"RAW EXTRACTED DATA:\n{raw_answer}"
+                    )
+                    with st.spinner("Summarizing key points for each judge..."):
+                        if hasattr(client, "chat") and hasattr(client.chat, "completions"):
+                            summary_resp = client.chat.completions.create(
+                                model=MODEL,
+                                messages=[{"role": "user", "content": summary_prompt}],
+                                temperature=0.0
+                            )
+                            if summary_resp.choices and summary_resp.choices[0].message.content:
+                                answer = summary_resp.choices[0].message.content.strip()
+                except Exception as e:
+                    pass # Fallback to raw text if error occurs
+
             with st.chat_message("assistant"):
                 st.markdown(answer)
             st.session_state.messages.append({"role": "assistant", "content": answer})
