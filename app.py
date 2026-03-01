@@ -224,6 +224,63 @@ def _case_name_from_first_page_text(text: str) -> str:
     return ""
 
 
+def _judges_from_first_page_text(text: str) -> list[str]:
+    """Extract the panel/coram judges from first-page text.
+
+    Handles both:
+    - A single CORAM line containing multiple judges
+    - Multiple lines each containing a judge ending with JSC/CJ/etc.
+    """
+    if not text:
+        return []
+
+    # Normalize spacing to make regex matching stable.
+    normalized = re.sub(r"\s+", " ", text)
+
+    # Match common judge suffixes seen in Ghana SC documents.
+    # Examples: "ATUGUBA, JSC (PRESIDING)", "BAFFOE-BONNIE AG. CJ (PRESIDING)", "AMADU JSC"
+    judge_re = re.compile(
+        r"(?P<judge>"
+        r"[A-Z][A-Z\- '\.()]*?"
+        r"\s*(?:,\s*)?"
+        r"(?:AG\.?\s*CJ|CJ|JSC|J\.?SC|JA|J\.?A\.?)(?:\s*\(PRESIDING\))?"
+        r")",
+        flags=re.IGNORECASE,
+    )
+
+    found = []
+    for m in judge_re.finditer(normalized):
+        j = m.group("judge")
+        j = re.sub(r"\s+", " ", j)
+        j = j.replace(" ,", ",").strip(" -–—:;,.\t")
+        if j:
+            found.append(j)
+
+    # De-dup, preserve order.
+    seen = set()
+    judges: list[str] = []
+    for j in found:
+        key = re.sub(r"\s+", " ", j).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        judges.append(j)
+    return judges
+
+
+def _judges_from_first_page(rec: dict[str, Any]) -> list[str]:
+    doc_path = (rec.get("document_path") or rec.get("document_filename") or "").strip()
+    if not doc_path:
+        return []
+    pdf_path = Path(doc_path)
+    if not pdf_path.is_absolute():
+        pdf_path = Path(str(pdf_path).replace("\\", os.sep))
+    if not pdf_path.exists():
+        pdf_path = Path(__file__).parent / Path(str(doc_path).replace("\\", os.sep))
+    text = _extract_first_page_text(str(pdf_path), (rec.get("document_sha256") or "").strip())
+    return _judges_from_first_page_text(text)
+
+
 def _main_case_name_from_first_page(rec: dict[str, Any]) -> str:
     doc_path = (rec.get("document_path") or rec.get("document_filename") or "").strip()
     if not doc_path:
@@ -425,6 +482,13 @@ RESPONSE RULES:
         "- If the user asks for the main/available cases, respond ONLY with the case names (no summaries, no filenames)."
     )
 
+    system += (
+        "\n\nJUDGES RULE (FIRST PAGE):\n"
+        "- The judges/coram are listed on the first page of the document.\n"
+        "- If the user asks who sat on a case (or who presided), answer ONLY from the first-page judges list.\n"
+        "- If judges are not available for a case, say so and do not guess."
+    )
+
     first_page_case_names = []
     for r in doc_records:
         name = _main_case_name_from_first_page(r)
@@ -442,6 +506,16 @@ RESPONSE RULES:
         system += "\n\nAVAILABLE CASES (from first page):\n" + "\n".join(
             f"- {name}" for name in first_page_case_names
         )
+
+    judges_lines: list[str] = []
+    for r in doc_records:
+        case_name = _main_case_name_from_first_page(r) or _case_name_from_record(r)
+        judges = _judges_from_first_page(r)
+        if case_name and judges:
+            judges_lines.append(f"- {case_name}: " + "; ".join(judges))
+
+    if judges_lines:
+        system += "\n\nJUDGES (from first page):\n" + "\n".join(judges_lines)
 
     # Deterministic handling: deployed models can occasionally drift on instruction-following.
     # For case-list queries, return the first-page-derived case names directly.
