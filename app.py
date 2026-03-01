@@ -275,17 +275,26 @@ def main() -> None:
     system += f"\n\nPractice area: {practice_area}" if practice_area else ""
     system += f"\nJurisdiction: {jurisdiction}" if jurisdiction else ""
 
-    if selected_case and selected_case != "(All cases)":
+    case_label = _display_case_label(selected_case) if selected_case and selected_case != "(All cases)" else ""
+    if case_label:
         system += (
             "\n\nFOCUS CASE:\n"
-            f"- The user selected this case to focus on: {selected_case}\n"
-            "- If the user’s question doesn’t name a case, assume they mean the selected case.\n"
-            "- If the user names a different case, follow the user."
+            f"- The user is asking about: {case_label}\n"
+            f"- Internal document filename: {selected_case}\n"
+            "- Search the vector store specifically for passages from this case.\n"
+            "- If the user's question doesn't name a specific case, assume they mean this focused case.\n"
+            "- If the user explicitly names a different case, follow the user."
         )
 
     file_search_tools = None
     if retrieval_enabled and vector_store_id:
-        file_search_tools = [{"type": "file_search", "vector_store_ids": [vector_store_id]}]
+        file_search_tools = [
+            {
+                "type": "file_search",
+                "vector_store_ids": [vector_store_id],
+                "max_num_results": 20,
+            }
+        ]
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
@@ -295,10 +304,21 @@ def main() -> None:
                 if file_search_tools:
                     create_kwargs["tools"] = file_search_tools
 
+                # Build the messages list, augmenting the last user message with
+                # the focused case label so the vector embedding targets the
+                # actual case name rather than a raw filename.
+                messages_for_api = list(st.session_state.messages)
+                if case_label and messages_for_api and messages_for_api[-1]["role"] == "user":
+                    last_user_content = messages_for_api[-1]["content"]
+                    messages_for_api[-1] = {
+                        "role": "user",
+                        "content": f"[Case: {case_label}] {last_user_content}",
+                    }
+
                 resp = client.responses.create(
                     model=MODEL,
                     instructions=system,
-                    input=st.session_state.messages,
+                    input=messages_for_api,
                     temperature=0,
                     **create_kwargs,
                 )
@@ -311,15 +331,27 @@ def main() -> None:
 
         if resp is not None and file_search_tools:
             citations = _extract_file_citations(resp)
+            # Resolve file_id → human-readable case label
+            file_id_to_name: dict[str, str] = {}
+            for c in citations:
+                fid = (c.get("file_id") or "").strip()
+                if fid and fid not in file_id_to_name:
+                    try:
+                        fobj = client.files.retrieve(fid)
+                        fn = (getattr(fobj, "filename", "") or "").strip()
+                        file_id_to_name[fid] = _display_case_label(fn) if fn else fid
+                    except Exception:
+                        file_id_to_name[fid] = fid
+
             if citations:
                 with st.expander("Sources"):
-                    for c in citations:
-                        file_id = (c.get("file_id") or "").strip()
+                    for i, c in enumerate(citations, start=1):
+                        fid = (c.get("file_id") or "").strip()
                         quote = (c.get("quote") or "").strip()
-                        if file_id:
-                            st.write(f"File: {file_id}")
+                        label = file_id_to_name.get(fid, fid)
+                        st.markdown(f"**[{i}] {label}**")
                         if quote:
-                            st.write(f"Quote: {quote}")
+                            st.caption(f'"{quote}"')
 
 
 if __name__ == "__main__":
