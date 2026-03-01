@@ -349,6 +349,13 @@ def _get_remote_filename(client: OpenAI, file_id: str) -> str:
         return ""
     return (getattr(fobj, "filename", "") or "").strip()
 
+
+def _is_election_petition_case_name(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    return ("akufo" in n and "mahama" in n) or ("election" in n and "petition" in n)
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -371,8 +378,10 @@ sidebar_case_names = sorted(
     )
 )
 
+dropdown_case_names = [n for n in sidebar_case_names if _is_election_petition_case_name(n)]
+
 if "selected_case" not in st.session_state:
-    st.session_state.selected_case = "(All cases)"
+    st.session_state.selected_case = dropdown_case_names[0] if dropdown_case_names else ""
 if "selected_case_prev" not in st.session_state:
     st.session_state.selected_case_prev = st.session_state.selected_case
 
@@ -391,16 +400,18 @@ with st.sidebar:
     st.divider()
 
     st.markdown("**Cases in the database**")
-    if sidebar_case_names:
+    if dropdown_case_names:
+        if st.session_state.selected_case not in dropdown_case_names:
+            st.session_state.selected_case = dropdown_case_names[0]
         st.selectbox(
             "Select a case",
-            ["(All cases)"] + sidebar_case_names,
+            dropdown_case_names,
             key="selected_case",
         )
         current = st.session_state.selected_case
         if current != st.session_state.selected_case_prev:
             st.session_state.selected_case_prev = current
-            if current and current != "(All cases)":
+            if current:
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
@@ -409,7 +420,9 @@ with st.sidebar:
                 )
             st.rerun()
     else:
-        st.caption("No cases found. Add PDFs under the docs folder.")
+        st.caption(
+            "Election petition case not found. Ensure the Akufo-Addo v Mahama ruling is available in `docs/` and/or `vector_store/*.vector_store_record.json`."
+        )
 
     if st.button("New chat"):
         st.session_state.messages = []
