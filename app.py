@@ -139,6 +139,28 @@ def _extract_first_page_text(pdf_path: str, doc_sha256: str = "") -> str:
         return ""
 
 
+@st.cache_data(show_spinner=False)
+def _extract_full_pdf_text(pdf_path: str, doc_sha256: str = "") -> str:
+    """Return extracted text for all pages of a PDF.
+
+    Used for evidence-based extraction (e.g., opinions/votes) when users ask
+    questions that require scanning beyond the first page.
+    """
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except Exception:
+        return ""
+
+    try:
+        reader = PdfReader(pdf_path)
+        parts: list[str] = []
+        for page in reader.pages or []:
+            parts.append((page.extract_text() or "").strip())
+        return "\n\n".join([p for p in parts if p]).strip()
+    except Exception:
+        return ""
+
+
 def _discover_local_pdfs() -> list[Path]:
     docs_dir = Path(__file__).parent / "docs"
     if not docs_dir.exists() or not docs_dir.is_dir():
@@ -346,6 +368,138 @@ def _is_case_list_query(text: str) -> bool:
         r"|\bcases\b.*\b(do you have|are available|in the vector store|in the uploaded documents)\b"
     )
     return re.search(pattern, t) is not None
+
+
+def _is_vote_query(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    pattern = (
+        r"\b(vote|voted|voting|majority|minority|dissent|dissenting|concurring|concur|\bwho\s+won\b|\bwho\s+lost\b)\b"
+        r"|\bhow\s+did\s+each\s+judge\s+vote\b"
+        r"|\bhow\s+did\s+the\s+judges\s+vote\b"
+        r"|\bwas\s+it\s+unanimous\b"
+    )
+    return re.search(pattern, t) is not None
+
+
+def _best_local_pdf_for_case(selected_case: str) -> Optional[Path]:
+    """Best-effort mapping from a selected case name to a local PDF."""
+    want = (selected_case or "").strip().lower()
+    if not want:
+        return None
+
+    manifest = _local_pdf_manifest()
+    for pdf_path in _discover_local_pdfs():
+        try:
+            st_ = pdf_path.stat()
+            sig = f"{st_.st_size}:{st_.st_mtime_ns}:{manifest}"
+        except Exception:
+            sig = manifest
+        first = _extract_first_page_text(str(pdf_path), doc_sha256=sig)
+        name = _case_name_from_first_page_text(first).strip().lower()
+        if name and name == want:
+            return pdf_path
+
+    # Fallback: token overlap heuristic.
+    want_tokens = {w for w in re.split(r"\W+", want) if len(w) >= 4}
+    best: tuple[int, Optional[Path]] = (0, None)
+    for pdf_path in _discover_local_pdfs():
+        try:
+            st_ = pdf_path.stat()
+            sig = f"{st_.st_size}:{st_.st_mtime_ns}:{manifest}"
+        except Exception:
+            sig = manifest
+        first = _extract_first_page_text(str(pdf_path), doc_sha256=sig)
+        name = _case_name_from_first_page_text(first).strip().lower()
+        hay = name or first.lower()
+        score = sum(1 for tok in want_tokens if tok in hay)
+        if score > best[0]:
+            best = (score, pdf_path)
+    return best[1]
+
+
+def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str, dict[str, str]]:
+    """Extract evidence-backed vote info per judge.
+
+    Returns mapping judge -> {"vote": str, "evidence": str}.
+    Only fills entries where explicit evidence is found.
+    """
+    if not full_text or not judges:
+        return {}
+
+    text = re.sub(r"\r\n?", "\n", full_text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Build positions of judge headings if present (common pattern: "NAME, JSC" etc).
+    headings: list[tuple[int, int, str]] = []
+    for judge in judges:
+        # Try to key off surname or the whole judge string.
+        j_norm = re.sub(r"\s+", " ", judge).strip()
+        surname = re.split(r"[,\s]", j_norm, maxsplit=1)[0]
+        surname = re.sub(r"[^A-Za-z\-']", "", surname)
+        pats = []
+        if j_norm:
+            pats.append(re.escape(j_norm))
+        if surname and len(surname) >= 3:
+            pats.append(re.escape(surname) + r".{0,40}?(?:JSC|CJ|AG\.?\s*CJ|JA)\b")
+
+        for pat in pats:
+            for m in re.finditer(pat, text, flags=re.IGNORECASE):
+                headings.append((m.start(), m.end(), judge))
+                break
+
+    headings = sorted(headings, key=lambda x: x[0])
+    # De-dup by judge (keep earliest heading).
+    seen_j = set()
+    unique: list[tuple[int, int, str]] = []
+    for s, e, j in headings:
+        key = j.lower()
+        if key in seen_j:
+            continue
+        seen_j.add(key)
+        unique.append((s, e, j))
+    headings = unique
+
+    def _classify(segment: str) -> tuple[str, str]:
+        seg = re.sub(r"\s+", " ", segment).strip()
+        # Strong signals first.
+        if re.search(r"\bdissent(ing)?\b", seg, flags=re.IGNORECASE):
+            return ("Dissenting", seg)
+        if re.search(r"\bconcurring\b|\bconcur\b", seg, flags=re.IGNORECASE):
+            return ("Concurring", seg)
+        # Outcome-ish signals.
+        if re.search(r"\bI\s+would\s+dismiss\b|\bI\s+dismiss\b|\bthe\s+appeal\s+is\s+dismissed\b", seg, flags=re.IGNORECASE):
+            return ("Supports dismissal", seg)
+        if re.search(r"\bI\s+would\s+allow\b|\bI\s+allow\b|\bthe\s+appeal\s+is\s+allowed\b", seg, flags=re.IGNORECASE):
+            return ("Supports allowing", seg)
+        return ("", "")
+
+    results: dict[str, dict[str, str]] = {}
+
+    # If headings exist, use per-judge segments; otherwise, fall back to global evidence.
+    if headings:
+        for idx, (s, e, judge) in enumerate(headings):
+            end = headings[idx + 1][0] if idx + 1 < len(headings) else min(len(text), s + 20000)
+            segment = text[s:end]
+            # Search within first 12k chars of segment for explicit vote markers.
+            window = segment[:12000]
+            m = re.search(
+                r"(.{0,120}?(?:dissent(ing)?|concurring|concur|I\s+would\s+dismiss|I\s+would\s+allow|appeal\s+is\s+dismissed|appeal\s+is\s+allowed).{0,160})",
+                window,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not m:
+                continue
+            snippet = re.sub(r"\s+", " ", m.group(1)).strip()
+            vote, evidence = _classify(snippet)
+            if vote and evidence:
+                results[judge] = {"vote": vote, "evidence": evidence}
+    else:
+        # Global fallback: never attribute to a judge without a judge heading.
+        pass
+
+    return results
 
 
 def _case_name_from_record(rec: dict[str, Any]) -> str:
@@ -644,6 +798,71 @@ RESPONSE RULES:
 
     if judges_lines:
         system += "\n\nJUDGES (from first page):\n" + "\n".join(judges_lines)
+
+    # Deterministic handling: vote questions are prone to hallucination if retrieval doesn't
+    # include explicit vote wording. For these queries, extract evidence directly from the PDF
+    # text and only report what is explicitly found.
+    if _is_vote_query(prompt):
+        target_case = selected_case if (selected_case and selected_case != "(All cases)") else ""
+        pdf_path = _best_local_pdf_for_case(target_case) if target_case else None
+
+        if pdf_path is None:
+            # If no explicit case selected, fall back to first local PDF (prototype-friendly).
+            local_pdfs = _discover_local_pdfs()
+            pdf_path = local_pdfs[0] if local_pdfs else None
+
+        if pdf_path is None:
+            answer = (
+                "No local PDF is available to scan for judge votes on this deployment. "
+                "Ensure the ruling PDF is present under the `docs/` folder."
+            )
+            with st.chat_message("assistant"):
+                st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.stop()
+
+        try:
+            st_ = pdf_path.stat()
+            sig = f"{st_.st_size}:{st_.st_mtime_ns}"
+        except Exception:
+            sig = ""
+
+        first_page = _extract_first_page_text(str(pdf_path), doc_sha256=sig)
+        case_name = _case_name_from_first_page_text(first_page) or pdf_path.name
+        coram = _judges_from_first_page_text(first_page)
+        full_text = _extract_full_pdf_text(str(pdf_path), doc_sha256=sig)
+        per_judge = _extract_votes_from_full_text(full_text, coram)
+
+        lines: list[str] = []
+        lines.append(f"Case: {case_name}")
+        lines.append("")
+        lines.append("Coram:")
+        if coram:
+            lines.extend([f"- {j}" for j in coram])
+        else:
+            lines.append("(Coram not found on the first page text.)")
+        lines.append("")
+        lines.append("Judicial Opinions / Votes (evidence-based):")
+        if per_judge:
+            for j in coram:
+                info = per_judge.get(j)
+                if not info:
+                    lines.append(f"- Judge {j}: Vote not explicitly found in extractable text.")
+                    continue
+                lines.append(f"- Judge {j}:")
+                lines.append(f"  Conclusion/Vote: {info.get('vote','')}")
+                lines.append(f"  Evidence: “{info.get('evidence','')}”")
+        else:
+            lines.append(
+                "No explicit vote wording could be located in the extractable text returned from this PDF. "
+                "If you want, ask a narrower question (e.g., 'quote where [Judge] states whether they dissent/agree') "
+                "or ensure the vector-store retrieval is returning the opinion sections."
+            )
+        answer = "\n".join(lines)
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.stop()
 
     # Deterministic handling: deployed models can occasionally drift on instruction-following.
     # For case-list queries, return the first-page-derived case names directly.
