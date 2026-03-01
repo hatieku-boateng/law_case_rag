@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -99,6 +100,110 @@ def _summarize_doc_record(rec: dict[str, Any]) -> str:
     title = (meta.get("title") or "").strip()
     cite = (meta.get("media_neutral_citation") or meta.get("citation_full") or "").strip()
     date = (meta.get("judgment_date_display") or meta.get("judgment_date") or "").strip()
+    bits = [b for b in [title, cite, date] if b]
+    return " — ".join(bits) if bits else "(metadata not available)"
+
+
+@st.cache_data(show_spinner=False)
+def _extract_first_page_text(pdf_path: str, doc_sha256: str = "") -> str:
+    """Return extracted text for the first page of a PDF.
+
+    `doc_sha256` is included to ensure Streamlit cache invalidates when the file changes.
+    """
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except Exception:
+        return ""
+
+    try:
+        reader = PdfReader(pdf_path)
+        if not reader.pages:
+            return ""
+        return (reader.pages[0].extract_text() or "").strip()
+    except Exception:
+        return ""
+
+
+def _case_name_from_first_page_text(text: str) -> str:
+    if not text:
+        return ""
+
+    raw_lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in raw_lines if ln]
+    if not lines:
+        return ""
+
+    # Filter out common header noise.
+    noise = re.compile(
+        r"^(republic of|in the|supreme court|court of|holden at|coram|before|judg(e)?ment|date\b|between\b)",
+        re.IGNORECASE,
+    )
+    candidates = [ln for ln in lines[:60] if not noise.search(ln)]
+    if not candidates:
+        candidates = lines[:60]
+
+    sep_re = re.compile(r"\b(v|vs|vrs|versus)\b\.?", re.IGNORECASE)
+
+    # 1) Look for a single line containing both parties.
+    for ln in candidates:
+        if sep_re.search(ln) and len(ln) <= 220:
+            # Normalize connector to 'v'.
+            normalized = sep_re.sub("v", ln)
+            normalized = re.sub(r"\s+", " ", normalized).strip(" -–—:;,.\t")
+            # Must contain at least one connector and reasonable length.
+            if re.search(r"\bv\b", normalized) and 5 < len(normalized) <= 220:
+                return normalized
+
+    # 2) Handle captions split across lines, e.g. party A / 'Vrs' / party B.
+    for i, ln in enumerate(candidates):
+        if re.match(r"^(v|vs|vrs|versus)\b\.?$", ln, flags=re.IGNORECASE):
+            prev_ln = candidates[i - 1] if i > 0 else ""
+            next_ln = candidates[i + 1] if i + 1 < len(candidates) else ""
+            combined = f"{prev_ln} v {next_ln}".strip()
+            combined = re.sub(r"\s+", " ", combined).strip(" -–—:;,.\t")
+            if re.search(r"\bv\b", combined) and 5 < len(combined) <= 220:
+                return combined
+
+        if re.match(r"^(v|vs|vrs|versus)\b", ln, flags=re.IGNORECASE):
+            prev_ln = candidates[i - 1] if i > 0 else ""
+            rest = sep_re.sub("v", ln)
+            combined = f"{prev_ln} {rest}".strip()
+            combined = re.sub(r"\s+", " ", combined).strip(" -–—:;,.\t")
+            if re.search(r"\bv\b", combined) and 5 < len(combined) <= 220:
+                return combined
+
+    # 3) Fallback: search across joined candidate text.
+    joined = " ".join(candidates)
+    joined = re.sub(r"\s+", " ", joined)
+    m = re.search(r"(.{0,60}?\b(?:v|vs|vrs|versus)\b\.?\s+.{0,80})", joined, flags=re.IGNORECASE)
+    if m:
+        s = sep_re.sub("v", m.group(1))
+        s = re.sub(r"\s+", " ", s).strip(" -–—:;,.\t")
+        if re.search(r"\bv\b", s) and 5 < len(s) <= 220:
+            return s
+
+    return ""
+
+
+def _main_case_name_from_first_page(rec: dict[str, Any]) -> str:
+    doc_path = (rec.get("document_path") or rec.get("document_filename") or "").strip()
+    if not doc_path:
+        return ""
+    pdf_path = Path(doc_path)
+    if not pdf_path.is_absolute():
+        pdf_path = Path(str(pdf_path).replace("\\", os.sep))
+    if not pdf_path.exists():
+        # Try resolving relative to workspace root.
+        pdf_path = Path(__file__).parent / Path(str(doc_path).replace("\\", os.sep))
+    text = _extract_first_page_text(str(pdf_path), (rec.get("document_sha256") or "").strip())
+    return _case_name_from_first_page_text(text)
+
+
+def _summarize_doc_record_with_case_name(rec: dict[str, Any], case_name: str) -> str:
+    meta = rec.get("metadata") or {}
+    cite = (meta.get("media_neutral_citation") or meta.get("citation_full") or "").strip()
+    date = (meta.get("judgment_date_display") or meta.get("judgment_date") or "").strip()
+    title = case_name.strip() or (meta.get("title") or "").strip()
     bits = [b for b in [title, cite, date] if b]
     return " — ".join(bits) if bits else "(metadata not available)"
 
@@ -244,6 +349,28 @@ RESPONSE RULES:
     if intake_bits:
         system += "\n\n" + "\n".join(intake_bits)
 
+    # Prompt refinement: case names must come from the first page of each PDF.
+    system += (
+        "\n\nCASE NAME RULE (FIRST PAGE):\n"
+        "- The main case name is always on the first page of the document.\n"
+        "- When you mention or list a case, use the exact case name as it appears on page 1.\n"
+        "- If the user asks for the main/available cases, respond ONLY with the case names (no summaries, no filenames)."
+    )
+
+    first_page_case_names = []
+    for r in doc_records:
+        name = _main_case_name_from_first_page(r)
+        if not name:
+            name = _case_name_from_record(r)
+        if name:
+            first_page_case_names.append(name)
+
+    first_page_case_names = sorted(set(first_page_case_names))
+    if first_page_case_names:
+        system += "\n\nAVAILABLE CASES (from first page):\n" + "\n".join(
+            f"- {name}" for name in first_page_case_names
+        )
+
     available_case_names = sorted({n for n in (_case_name_from_record(r) for r in doc_records) if n})
     if available_case_names:
         system += "\n\nAVAILABLE CASES (from metadata):\n" + "\n".join(
@@ -289,7 +416,8 @@ RESPONSE RULES:
 
                             st.markdown(f"**Source {i}**")
                             if local_rec is not None:
-                                st.caption(_summarize_doc_record(local_rec))
+                                case_name = _main_case_name_from_first_page(local_rec)
+                                st.caption(_summarize_doc_record_with_case_name(local_rec, case_name))
                                 st.caption(f"filename: {local_rec.get('document_filename', '')}")
                             elif remote_filename:
                                 st.caption(f"filename: {remote_filename}")
