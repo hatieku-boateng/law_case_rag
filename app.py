@@ -79,6 +79,14 @@ def _find_vector_store_id_by_name(client: OpenAI, name: str) -> Optional[str]:
     return None
 
 
+# Hardcoded display labels for known documents.
+# Key = exact filename as uploaded to the vector store.
+# Value = short human-readable case label shown in the UI.
+CASE_LABELS: dict[str, str] = {
+    "doc_2.pdf": "2012 Presidential Election Petition (Akufo-Addo & Others v Mahama & Others)",
+}
+
+
 @st.cache_data(ttl=3600)
 def _fetch_case_title_from_vs(api_key: str, vector_store_id: str, filename: str) -> Optional[str]:
     """Ask the vector store for the exact case title of the given document."""
@@ -107,6 +115,10 @@ def _fetch_case_title_from_vs(api_key: str, vector_store_id: str, filename: str)
 def _display_case_label(filename: str, api_key: str = "", vector_store_id: str = "") -> str:
     if filename == "(All cases)":
         return filename
+    # 1. Check hardcoded map first
+    if filename in CASE_LABELS:
+        return CASE_LABELS[filename]
+    # 2. Fall back to VS query
     if api_key and vector_store_id:
         title = _fetch_case_title_from_vs(api_key, vector_store_id, filename)
         if title:
