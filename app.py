@@ -1,4 +1,5 @@
 import json
+import html
 import os
 import re
 from pathlib import Path
@@ -14,6 +15,22 @@ st.set_page_config(
     page_icon="⚖️",
     layout="wide",
 )
+
+st.markdown(
+    """
+<style>
+  .case-list { overflow-x: auto; }
+  .case-list ul { padding-left: 1.25rem; margin: 0; }
+  .case-list li { white-space: nowrap; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+def _render_case_list_html(names: list[str]) -> str:
+    items = "\n".join(f"<li>{html.escape(n)}</li>" for n in names)
+    return f"<div class=\"case-list\"><ul>{items}</ul></div>"
 
 def _mask_key(key: str) -> str:
     if not key:
@@ -387,7 +404,7 @@ with st.sidebar:
 
     st.markdown("**Cases in the database**")
     if sidebar_case_names:
-        st.markdown("\n".join(f"- {name}" for name in sidebar_case_names))
+        st.markdown(_render_case_list_html(sidebar_case_names), unsafe_allow_html=True)
     else:
         st.caption("No cases found. Add PDFs under the docs folder and/or add vector_store record JSON files.")
 
