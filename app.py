@@ -1,5 +1,4 @@
 import json
-import html
 import os
 import re
 from pathlib import Path
@@ -15,22 +14,6 @@ st.set_page_config(
     page_icon="⚖️",
     layout="wide",
 )
-
-st.markdown(
-    """
-<style>
-  .case-list { overflow-x: auto; }
-  .case-list ul { padding-left: 1.25rem; margin: 0; }
-  .case-list li { white-space: nowrap; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
-def _render_case_list_html(names: list[str]) -> str:
-    items = "\n".join(f"<li>{html.escape(n)}</li>" for n in names)
-    return f"<div class=\"case-list\"><ul>{items}</ul></div>"
 
 def _mask_key(key: str) -> str:
     if not key:
@@ -388,6 +371,11 @@ sidebar_case_names = sorted(
     )
 )
 
+if "selected_case" not in st.session_state:
+    st.session_state.selected_case = "(All cases)"
+if "selected_case_prev" not in st.session_state:
+    st.session_state.selected_case_prev = st.session_state.selected_case
+
 
 with st.sidebar:
     practice_area = st.selectbox(
@@ -404,9 +392,24 @@ with st.sidebar:
 
     st.markdown("**Cases in the database**")
     if sidebar_case_names:
-        st.markdown(_render_case_list_html(sidebar_case_names), unsafe_allow_html=True)
+        st.selectbox(
+            "Select a case",
+            ["(All cases)"] + sidebar_case_names,
+            key="selected_case",
+        )
+        current = st.session_state.selected_case
+        if current != st.session_state.selected_case_prev:
+            st.session_state.selected_case_prev = current
+            if current and current != "(All cases)":
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"Selected case: **{current}**. What would you like to know about it?",
+                    }
+                )
+            st.rerun()
     else:
-        st.caption("No cases found. Add PDFs under the docs folder and/or add vector_store record JSON files.")
+        st.caption("No cases found. Add PDFs under the docs folder.")
 
     if st.button("New chat"):
         st.session_state.messages = []
@@ -462,6 +465,9 @@ if prompt:
         intake_bits.append(f"Practice area: {practice_area}")
     if jurisdiction.strip():
         intake_bits.append(f"Jurisdiction: {jurisdiction.strip()}")
+    selected_case = (st.session_state.get("selected_case") or "").strip()
+    if selected_case and selected_case != "(All cases)":
+        intake_bits.append(f"Selected case (user focus): {selected_case}")
 
     system = """
 You are a legal research assistant specialised in analysing Supreme Court case law from the documents available in the vector store.
@@ -510,6 +516,14 @@ RESPONSE RULES:
 """.strip()
     if intake_bits:
         system += "\n\n" + "\n".join(intake_bits)
+
+    if selected_case and selected_case != "(All cases)":
+        system += (
+            "\n\nFOCUS CASE:\n"
+            f"- The user selected this case to focus on: {selected_case}\n"
+            "- If the user’s question doesn’t name a case, assume they mean the selected case.\n"
+            "- If the user names a different case, follow the user."
+        )
 
     # Prompt refinement: case names must come from the first page of each PDF.
     system += (
