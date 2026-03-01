@@ -208,6 +208,23 @@ def _summarize_doc_record_with_case_name(rec: dict[str, Any], case_name: str) ->
     return " — ".join(bits) if bits else "(metadata not available)"
 
 
+def _is_case_list_query(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # Examples:
+    # - what cases do you have
+    # - what are the main cases
+    # - list the available cases
+    # - which cases are in the vector store
+    pattern = (
+        r"\b(what|which|list|show)\b.*\b(main|available)?\b.*\bcases\b"
+        r"|\bcases\b.*\b(do you have|are available|in the vector store|in the uploaded documents)\b"
+    )
+    return re.search(pattern, t) is not None
+
+
 def _case_name_from_record(rec: dict[str, Any]) -> str:
     meta = rec.get("metadata") or {}
     title = (meta.get("title") or "").strip()
@@ -371,6 +388,15 @@ RESPONSE RULES:
             f"- {name}" for name in first_page_case_names
         )
 
+    # Deterministic handling: deployed models can occasionally drift on instruction-following.
+    # For case-list queries, return the first-page-derived case names directly.
+    if _is_case_list_query(prompt) and first_page_case_names:
+        answer = "\n".join(f"- {name}" for name in first_page_case_names)
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.stop()
+
     available_case_names = sorted({n for n in (_case_name_from_record(r) for r in doc_records) if n})
     if available_case_names:
         system += "\n\nAVAILABLE CASES (from metadata):\n" + "\n".join(
@@ -392,11 +418,9 @@ RESPONSE RULES:
 
                     resp = client.responses.create(
                         model=MODEL,
-                        input=[
-                            {"role": "system", "content": system},
-                            *st.session_state.messages[:-1],
-                            {"role": "user", "content": augmented_user},
-                        ],
+                        instructions=system,
+                        input=st.session_state.messages,
+                        temperature=0,
                         **create_kwargs,
                     )
                     answer = (resp.output_text or "").strip() or "(No response text.)"
