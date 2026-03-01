@@ -137,7 +137,7 @@ with st.sidebar:
         st.session_state.messages = []
 
 
-st.markdown("# ⚖️ Law Firm RAQ Assistant")
+st.markdown("# ⚖️ The Law Student Assistant")
 st.caption(
     "Research-and-answer chat for legal teams. Outputs may be incomplete; verify against primary sources."
 )
