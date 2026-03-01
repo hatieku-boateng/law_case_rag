@@ -236,7 +236,8 @@ def main() -> None:
         dropdown = ["(All cases)"] + case_names if case_names else ["(All cases)"]
 
         if "selected_case" not in st.session_state:
-            st.session_state.selected_case = dropdown[0]
+            # Auto-select the first real case if only one exists, otherwise default to All cases
+            st.session_state.selected_case = case_names[0] if len(case_names) == 1 else dropdown[0]
 
         st.markdown("**Cases**")
         st.selectbox(
