@@ -809,6 +809,9 @@ st.caption(
     "Research-and-answer chat for legal teams. Outputs may be incomplete; verify against primary sources."
 )
 
+if st.session_state.get("selected_case"):
+    st.info(f"**Focused Case:** {st.session_state.selected_case}")
+
 
 client: Optional[OpenAI]
 api_key = os.getenv("OPENAI_API_KEY", "").strip()
