@@ -420,10 +420,16 @@ def _best_local_pdf_for_case(selected_case: str) -> Optional[Path]:
 
 
 def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str, dict[str, str]]:
-    """Extract evidence-backed vote info per judge.
+    """Extract evidence-backed vote + submission snippets per judge.
 
-    Returns mapping judge -> {"vote": str, "evidence": str}.
-    Only fills entries where explicit evidence is found.
+    Returns mapping judge ->
+      {
+        "vote": str,
+        "vote_evidence": str,
+        "submission_extract": str,
+      }
+
+    Only fills fields when explicit extractable evidence is found.
     """
     if not full_text or not judges:
         return {}
@@ -434,24 +440,25 @@ def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str
     # Build positions of judge headings if present (common pattern: "NAME, JSC" etc).
     headings: list[tuple[int, int, str]] = []
     for judge in judges:
-        # Try to key off surname or the whole judge string.
         j_norm = re.sub(r"\s+", " ", judge).strip()
         surname = re.split(r"[,\s]", j_norm, maxsplit=1)[0]
         surname = re.sub(r"[^A-Za-z\-']", "", surname)
-        pats = []
+
+        pats: list[str] = []
         if j_norm:
             pats.append(re.escape(j_norm))
         if surname and len(surname) >= 3:
             pats.append(re.escape(surname) + r".{0,40}?(?:JSC|CJ|AG\.?\s*CJ|JA)\b")
 
         for pat in pats:
-            for m in re.finditer(pat, text, flags=re.IGNORECASE):
+            m = re.search(pat, text, flags=re.IGNORECASE)
+            if m:
                 headings.append((m.start(), m.end(), judge))
                 break
 
     headings = sorted(headings, key=lambda x: x[0])
     # De-dup by judge (keep earliest heading).
-    seen_j = set()
+    seen_j: set[str] = set()
     unique: list[tuple[int, int, str]] = []
     for s, e, j in headings:
         key = j.lower()
@@ -461,43 +468,67 @@ def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str
         unique.append((s, e, j))
     headings = unique
 
-    def _classify(segment: str) -> tuple[str, str]:
-        seg = re.sub(r"\s+", " ", segment).strip()
-        # Strong signals first.
+    def _classify(snippet: str) -> tuple[str, str]:
+        seg = re.sub(r"\s+", " ", snippet).strip()
+        if not seg:
+            return ("", "")
         if re.search(r"\bdissent(ing)?\b", seg, flags=re.IGNORECASE):
             return ("Dissenting", seg)
         if re.search(r"\bconcurring\b|\bconcur\b", seg, flags=re.IGNORECASE):
             return ("Concurring", seg)
-        # Outcome-ish signals.
-        if re.search(r"\bI\s+would\s+dismiss\b|\bI\s+dismiss\b|\bthe\s+appeal\s+is\s+dismissed\b", seg, flags=re.IGNORECASE):
+        if re.search(
+            r"\bI\s+would\s+dismiss\b|\bI\s+dismiss\b|\bthe\s+appeal\s+is\s+dismissed\b",
+            seg,
+            flags=re.IGNORECASE,
+        ):
             return ("Supports dismissal", seg)
-        if re.search(r"\bI\s+would\s+allow\b|\bI\s+allow\b|\bthe\s+appeal\s+is\s+allowed\b", seg, flags=re.IGNORECASE):
+        if re.search(
+            r"\bI\s+would\s+allow\b|\bI\s+allow\b|\bthe\s+appeal\s+is\s+allowed\b",
+            seg,
+            flags=re.IGNORECASE,
+        ):
             return ("Supports allowing", seg)
         return ("", "")
 
+    def _extract_submission(window: str) -> str:
+        w = re.sub(r"\s+", " ", window).strip()
+        if not w:
+            return ""
+        m = re.search(
+            r"(.{0,80}?(?:I\s+(?:have\s+)?(?:read|consider)|in\s+my\s+view|I\s+am\s+of\s+the\s+opinion|I\s+hold|I\s+think|I\s+agree|I\s+dissent).{0,420})",
+            w,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return re.sub(r"\s+", " ", m.group(1)).strip()
+        return w[:520].strip()
+
     results: dict[str, dict[str, str]] = {}
 
-    # If headings exist, use per-judge segments; otherwise, fall back to global evidence.
     if headings:
         for idx, (s, e, judge) in enumerate(headings):
             end = headings[idx + 1][0] if idx + 1 < len(headings) else min(len(text), s + 20000)
             segment = text[s:end]
-            # Search within first 12k chars of segment for explicit vote markers.
             window = segment[:12000]
             m = re.search(
                 r"(.{0,120}?(?:dissent(ing)?|concurring|concur|I\s+would\s+dismiss|I\s+would\s+allow|appeal\s+is\s+dismissed|appeal\s+is\s+allowed).{0,160})",
                 window,
                 flags=re.IGNORECASE | re.DOTALL,
             )
-            if not m:
-                continue
-            snippet = re.sub(r"\s+", " ", m.group(1)).strip()
-            vote, evidence = _classify(snippet)
-            if vote and evidence:
-                results[judge] = {"vote": vote, "evidence": evidence}
-    else:
-        # Global fallback: never attribute to a judge without a judge heading.
-        pass
+            snippet = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+            vote, vote_ev = _classify(snippet)
+
+            after_heading = segment[max(0, e - s) : max(0, e - s) + 6000]
+            submission = _extract_submission(after_heading)
+
+            out: dict[str, str] = {}
+            if vote and vote_ev:
+                out["vote"] = vote
+                out["vote_evidence"] = vote_ev
+            if submission:
+                out["submission_extract"] = submission
+            if out:
+                results[judge] = out
 
     return results
 
@@ -842,7 +873,7 @@ RESPONSE RULES:
         else:
             lines.append("(Coram not found on the first page text.)")
         lines.append("")
-        lines.append("Judicial Opinions / Votes (evidence-based):")
+        lines.append("Judicial Opinions / Votes (evidence-based extracts):")
         if per_judge:
             for j in coram:
                 info = per_judge.get(j)
@@ -850,8 +881,16 @@ RESPONSE RULES:
                     lines.append(f"- Judge {j}: Vote not explicitly found in extractable text.")
                     continue
                 lines.append(f"- Judge {j}:")
-                lines.append(f"  Conclusion/Vote: {info.get('vote','')}")
-                lines.append(f"  Evidence: “{info.get('evidence','')}”")
+                if info.get("vote"):
+                    lines.append(f"  Conclusion/Vote: {info.get('vote','')}")
+                    lines.append(f"  Vote Evidence: “{info.get('vote_evidence','')}”")
+                else:
+                    lines.append("  Conclusion/Vote: (Not explicitly found in extractable text.)")
+
+                if info.get("submission_extract"):
+                    lines.append(f"  Submission (extract): “{info.get('submission_extract','')}”")
+                else:
+                    lines.append("  Submission (extract): (Not located in the extractable text window for this judge.)")
         else:
             lines.append(
                 "No explicit vote wording could be located in the extractable text returned from this PDF. "
