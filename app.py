@@ -115,8 +115,6 @@ if "messages" not in st.session_state:
 
 
 with st.sidebar:
-    st.markdown("## Matter Intake")
-    matter_name = st.text_input("Matter name", placeholder="e.g., ACME v. Smith")
     practice_area = st.selectbox(
         "Practice area",
         [
@@ -156,7 +154,7 @@ vector_store_record = _load_vector_store_record()
 vector_store_id = (vector_store_record or {}).get("vector_store_id") if vector_store_record else None
 if not vector_store_id and client is not None:
     vector_store_id = _find_vector_store_id_by_name(client, VECTOR_STORE_NAME)
-retrieval_enabled = practice_area == "Supreme Court"
+retrieval_enabled = True
 
 doc_records = _load_all_doc_records()
 doc_record_by_file_id = {
@@ -183,16 +181,11 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 
-if not retrieval_enabled:
-    st.info("Chat is currently disabled. Select Practice area = Supreme Court to enable retrieval chat.")
-
-prompt = st.chat_input("Ask a question about your matter…", disabled=not retrieval_enabled)
+prompt = st.chat_input("Ask a question about your matter…")
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     intake_bits = []
-    if matter_name.strip():
-        intake_bits.append(f"Matter: {matter_name.strip()}")
     if practice_area:
         intake_bits.append(f"Practice area: {practice_area}")
     if jurisdiction.strip():
