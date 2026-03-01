@@ -1,45 +1,15 @@
 import json
 import os
-import re
-from pathlib import Path
 from typing import Any, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
-
-st.set_page_config(
-    page_title="The Law Student Assistant",
-    page_icon="⚖️",
-    layout="wide",
-)
-
-# Chat layout: user messages on the right, assistant on the left.
-st.markdown(
-        """
-<style>
-    div[data-testid="stChatMessage"]:has(.user-msg-marker) {
-        flex-direction: row-reverse;
-    }
-    div[data-testid="stChatMessage"]:has(.user-msg-marker) div[data-testid="stChatMessageContent"] {
-        text-align: right;
-    }
-</style>
-""",
-        unsafe_allow_html=True,
-)
-
-def _mask_key(key: str) -> str:
-    if not key:
-        return "(missing)"
-    return key[:7] + "…" + key[-4:] if len(key) > 12 else "(set)"
-
-
-load_dotenv()
-
-MODEL = "gpt-4o"
-VECTOR_STORE_NAME = "supreme court cases"
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+VECTOR_STORE_NAME = os.getenv("OPENAI_VECTOR_STORE_NAME", "supreme court cases")
+VECTOR_STORE_ID = os.getenv("OPENAI_VECTOR_STORE_ID", "").strip() or None
+VECTOR_STORE_SUMMARY_PATH = os.path.join("embeddings", "vector_store.supreme-court-cases.json")
 
 
 BASE_SYSTEM_PROMPT = """
@@ -53,28 +23,17 @@ NON-NEGOTIABLE GROUNDING RULE:
 
 RETRIEVAL WORKFLOW (FOLLOW THIS ORDER):
 1) Retrieve: search for the most relevant excerpts first (especially headings like JUDGMENT/JUDGEMENT/RULING/OPINION and the judge surname + "JSC").
-    If the user asks for submissions/opinions/votes per judge, you MUST repeat retrieval per judge (one judge at a time) until you either find a quote for that judge or you conclude it is not present in retrieved text.
 2) Verify: before you claim anything (submission/vote/outcome), confirm the exact wording exists in the retrieved text.
 3) Quote: when you present a per-judge submission/opinion/conclusion/vote, include at least one direct quote copied verbatim.
 4) If you cannot quote it verbatim, you must write: "Not found in retrieved text." (no paraphrase, no guessing).
 
-CASE NAME + CORAM RULE (FIRST PAGE):
-- The case name and Coram (judges) usually appear on page 1.
-- Do NOT treat Coram, case caption, or front-matter as a judge's submission/reasoning.
-
 JUDGE ATTRIBUTION SAFETY:
 - Only attribute text to a judge if it appears inside that judge’s own opinion/judgment section.
 - Do NOT misattribute citations like "opinion of Justice X in another case" as Justice X’s submission in the current case.
-- Ignore role markers like "(PRESIDING)" for submissions; those are not reasoning.
 
 VOTES / OUTCOME SAFETY:
 - Do NOT infer "dismissed/allowed/unanimous" unless the retrieved text explicitly states it and you can quote it.
 - Do NOT infer how each judge voted unless the retrieved text explicitly indicates concurrence/dissent/allow/dismiss (quote required).
-
-MANDATORY PER-JUDGE COVERAGE:
-- If you have a Coram list (judges who sat), you MUST produce a per-judge entry for EVERY judge in the Coram whenever the user asks about submissions/opinions/reasoning/conclusions/votes.
-- For each judge, output either (a) a direct quote showing that judge's submission/opinion/reasoning, or (b) "Not found in retrieved text.".
-- Do not skip judges.
 
 RESPONSE FORMAT (USE THIS STRUCTURE WHEN APPLICABLE):
 
@@ -93,40 +52,19 @@ Per-Judge Analysis (evidence-only):
 Decision Outcome (evidence-only):
 - "..." OR Not found in retrieved text.
 
-Participation Notes (if stated):
-- "..." OR Not found in retrieved text.
-
 If the user asks for legal advice:
 - Provide general information only from retrieved case law and state it is not legal advice.
 """.strip()
 
 
-def _load_vector_store_record() -> Optional[dict[str, Any]]:
-    paths = [
-        os.path.join("embeddings", "vector_store.supreme-court-cases.json"),
-        os.path.join("vector_store", "doc_1.vector_store_record.json"),
-        os.path.join("vector_store", "doc_2.vector_store_record.json"),
-    ]
-    for path in paths:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            continue
-    return None
-
-
-def _load_all_doc_records() -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    base = Path("vector_store")
-    if not base.exists() or not base.is_dir():
-        return records
-    for path in sorted(base.glob("*.vector_store_record.json")):
-        try:
-            records.append(json.loads(path.read_text(encoding="utf-8")))
-        except Exception:
-            continue
-    return records
+def _load_vector_store_id_from_summary_file() -> Optional[str]:
+    try:
+        with open(VECTOR_STORE_SUMMARY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        vs_id = (data.get("vector_store_id") or "").strip()
+        return vs_id or None
+    except Exception:
+        return None
 
 
 def _find_vector_store_id_by_name(client: OpenAI, name: str) -> Optional[str]:
@@ -134,10 +72,96 @@ def _find_vector_store_id_by_name(client: OpenAI, name: str) -> Optional[str]:
         page = client.vector_stores.list(limit=100)
     except Exception:
         return None
+
     for vs in getattr(page, "data", []) or []:
         if (getattr(vs, "name", "") or "") == name:
             return getattr(vs, "id", None)
     return None
+
+
+@st.cache_data(ttl=300)
+def _case_label_from_local_pdf(filename: str) -> Optional[str]:
+    pdf_path = os.path.join("docs", filename)
+    if not os.path.isfile(pdf_path):
+        return None
+
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        reader = PdfReader(pdf_path)
+        if not reader.pages:
+            return None
+        text = (reader.pages[0].extract_text() or "").strip()
+    except Exception:
+        return None
+
+    if not text:
+        return None
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    # Heuristic: prefer a line that looks like a case caption.
+    keywords = (" v ", " v. ", " vs ", " vs. ", " vrs ", " vrs. ")
+    for ln in lines[:40]:
+        low = f" {ln.lower()} "
+        if any(k in low for k in keywords):
+            return ln
+
+    # Fallback: use the first meaningful line.
+    return lines[0]
+
+
+def _display_case_label(filename: str) -> str:
+    if filename == "(All cases)":
+        return filename
+    label = _case_label_from_local_pdf(filename)
+    return label or filename
+
+
+@st.cache_data(ttl=300)
+def _list_vector_store_filenames(api_key_present: bool, vector_store_id: str) -> list[str]:
+    if not api_key_present or not vector_store_id:
+        return []
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "").strip())
+
+    filenames: list[str] = []
+    after = None
+    # Keep this conservative; it’s just for a dropdown.
+    for _ in range(5):
+        kwargs: dict[str, Any] = {"vector_store_id": vector_store_id, "limit": 100}
+        if after:
+            kwargs["after"] = after
+        page = client.vector_stores.files.list(**kwargs)
+        items = getattr(page, "data", []) or []
+        if not items:
+            break
+
+        for item in items:
+            file_id = getattr(item, "file_id", None) or getattr(item, "id", None)
+            if not file_id:
+                continue
+            try:
+                fobj = client.files.retrieve(file_id)
+                fn = (getattr(fobj, "filename", "") or "").strip()
+                if fn:
+                    filenames.append(fn)
+            except Exception:
+                continue
+
+        if not bool(getattr(page, "has_more", False)):
+            break
+        after = getattr(items[-1], "id", None)
+        if not after:
+            break
+
+    # De-dup + stable sort
+    return sorted({f for f in filenames if f}, key=lambda s: s.lower())
 
 
 def _extract_file_citations(resp: Any) -> list[dict[str, str]]:
@@ -150,15 +174,16 @@ def _extract_file_citations(resp: Any) -> list[dict[str, str]]:
                 continue
             annotations = getattr(item, "annotations", None) or []
             for ann in annotations:
-                ann_type = getattr(ann, "type", None)
-                if ann_type != "file_citation":
+                if getattr(ann, "type", None) != "file_citation":
                     continue
-                file_id = getattr(ann, "file_id", "") or ""
-                quote = getattr(ann, "quote", "") or ""
-                citations.append({"file_id": file_id, "quote": quote})
+                citations.append(
+                    {
+                        "file_id": getattr(ann, "file_id", "") or "",
+                        "quote": getattr(ann, "quote", "") or "",
+                    }
+                )
 
-    # De-dup
-    seen = set()
+    seen: set[tuple[str, str]] = set()
     unique: list[dict[str, str]] = []
     for c in citations:
         key = (c.get("file_id", ""), c.get("quote", ""))
@@ -169,175 +194,86 @@ def _extract_file_citations(resp: Any) -> list[dict[str, str]]:
     return unique
 
 
-def _summarize_doc_record(rec: dict[str, Any]) -> str:
-    meta = rec.get("metadata") or {}
-    title = (meta.get("title") or "").strip()
-    cite = (meta.get("media_neutral_citation") or meta.get("citation_full") or "").strip()
-    date = (meta.get("judgment_date_display") or meta.get("judgment_date") or "").strip()
-    bits = [b for b in [title, cite, date] if b]
-    return " — ".join(bits) if bits else "(metadata not available)"
+def _mask_key(key: str) -> str:
+    if not key:
+        return "(missing)"
+    return key[:7] + "…" + key[-4:] if len(key) > 12 else "(set)"
 
 
-def _case_name_from_record(rec: dict[str, Any]) -> str:
-    meta = rec.get("metadata") or {}
-    title = (meta.get("title") or "").strip()
-    if title:
-        return title
-    filename = (rec.get("document_filename") or rec.get("filename") or "").strip()
-    return filename
+def main() -> None:
+    st.set_page_config(page_title="The Law Student Assistant", page_icon="⚖️", layout="wide")
 
+    load_dotenv()
 
-def _get_remote_filename(client: OpenAI, file_id: str) -> str:
-    try:
-        fobj = client.files.retrieve(file_id)
-    except Exception:
-        return ""
-    return (getattr(fobj, "filename", "") or "").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    client: Optional[OpenAI] = OpenAI(api_key=api_key) if api_key else None
 
+    st.markdown("# ⚖️ The Law Student Assistant")
+    st.caption("Research-and-answer chat for legal teams. Outputs may be incomplete; verify against primary sources.")
 
-def _is_election_petition_case_name(name: str) -> bool:
-    n = (name or "").strip().lower()
-    if not n:
-        return False
-    return ("akufo" in n and "mahama" in n) or ("election" in n and "petition" in n)
+    if not api_key:
+        st.warning("Set OPENAI_API_KEY in .env to enable chat.")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    vector_store_id = VECTOR_STORE_ID or _load_vector_store_id_from_summary_file()
+    if not vector_store_id and client is not None:
+        vector_store_id = _find_vector_store_id_by_name(client, VECTOR_STORE_NAME)
 
+    retrieval_enabled = bool(api_key and vector_store_id)
 
-doc_records = _load_all_doc_records()
-doc_record_by_file_id = {
-    (r.get("file_id") or "").strip(): r for r in doc_records if (r.get("file_id") or "").strip()
-}
+    with st.sidebar:
+        practice_area = st.selectbox("Practice area", ["Supreme Court"], index=0)
+        jurisdiction = st.selectbox("Jurisdiction", ["Ghana"], index=0)
 
-sidebar_case_names = sorted(
-    set(
-        [
-            n
-            for n in [_case_name_from_record(r) for r in doc_records]
-            if n
-        ]
-    )
-)
+        st.divider()
 
-dropdown_case_names = [n for n in sidebar_case_names if _is_election_petition_case_name(n)]
+        case_names: list[str] = []
+        if retrieval_enabled:
+            case_names = _list_vector_store_filenames(True, vector_store_id or "")
 
-if "selected_case" not in st.session_state:
-    st.session_state.selected_case = dropdown_case_names[0] if dropdown_case_names else ""
-if "selected_case_prev" not in st.session_state:
-    st.session_state.selected_case_prev = st.session_state.selected_case
+        dropdown = ["(All cases)"] + case_names if case_names else ["(All cases)"]
 
+        if "selected_case" not in st.session_state:
+            st.session_state.selected_case = dropdown[0]
 
-with st.sidebar:
-    practice_area = st.selectbox(
-        "Practice area",
-        [
-            
-            "Supreme Court",
-        ],
-        index=0,
-    )
-    jurisdiction = st.selectbox("Jurisdiction", ["Ghana"], index=0)
-
-    st.divider()
-
-    st.markdown("**Cases in the database**")
-    if dropdown_case_names:
-        if st.session_state.selected_case not in dropdown_case_names:
-            st.session_state.selected_case = dropdown_case_names[0]
+        st.markdown("**Cases**")
         st.selectbox(
-            "Select a case",
-            dropdown_case_names,
+            "Focused case",
+            dropdown,
             key="selected_case",
+            format_func=_display_case_label,
         )
-        current = st.session_state.selected_case
-        if current != st.session_state.selected_case_prev:
-            st.session_state.selected_case_prev = current
-            if current:
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": f"Selected case: **{current}**. What would you like to know about it?",
-                    }
-                )
+
+        if st.button("New chat"):
+            st.session_state.messages = []
             st.rerun()
-    else:
-        st.caption(
-            "Election petition case not found. Ensure the case rulings are available in the vector store."
-        )
 
-    if st.button("New chat"):
-        st.session_state.messages = []
-
-
-st.markdown("# ⚖️ The Law Student Assistant")
-st.caption(
-    "Research-and-answer chat for legal teams. Outputs may be incomplete; verify against primary sources."
-)
-
-if st.session_state.get("selected_case"):
-    st.info(f"**Focused Case:** {st.session_state.selected_case}")
-
-
-client: Optional[OpenAI]
-api_key = os.getenv("OPENAI_API_KEY", "").strip()
-if api_key:
-    client = OpenAI(api_key=api_key)
-else:
-    client = None
-    st.warning("Set OPENAI_API_KEY in .env to enable chat.")
-
-
-vector_store_record = _load_vector_store_record()
-vector_store_id = (vector_store_record or {}).get("vector_store_id") if vector_store_record else None
-if not vector_store_id and client is not None:
-    vector_store_id = _find_vector_store_id_by_name(client, VECTOR_STORE_NAME)
-retrieval_enabled = True
-
-file_search_tools = None
-if retrieval_enabled:
-    if vector_store_id:
-        file_search_tools = [
-            {
-                "type": "file_search",
-                "vector_store_ids": [vector_store_id],
-            }
-        ]
-    else:
-        st.info(
-            "Vector store not found. Please ensure your documents are ingested into the OpenAI Vector Store."
-        )
-
-
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg["role"] == "user":
-            st.markdown('<span class="user-msg-marker"></span>', unsafe_allow_html=True)
-
-
-prompt = st.chat_input("Ask a question about your matter…")
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
-
-    # Render the just-submitted user message immediately.
-    # The chat history above was rendered before we appended this prompt.
-    with st.chat_message("user"):
-        st.markdown(prompt)
-        st.markdown('<span class="user-msg-marker"></span>', unsafe_allow_html=True)
-
-    intake_bits = []
-    if practice_area:
-        intake_bits.append(f"Practice area: {practice_area}")
-    if jurisdiction.strip():
-        intake_bits.append(f"Jurisdiction: {jurisdiction.strip()}")
     selected_case = (st.session_state.get("selected_case") or "").strip()
     if selected_case and selected_case != "(All cases)":
-        intake_bits.append(f"Selected case (user focus): {selected_case}")
+        st.info(f"**Focused Case:** {_display_case_label(selected_case)}")
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    prompt = st.chat_input("Ask a question about your matter…")
+    if not prompt:
+        return
+
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    if client is None:
+        with st.chat_message("assistant"):
+            st.markdown("API key missing. Add OPENAI_API_KEY to your .env.")
+        return
 
     system = BASE_SYSTEM_PROMPT
-    if intake_bits:
-        system += "\n\n" + "\n".join(intake_bits)
+    system += f"\n\nPractice area: {practice_area}" if practice_area else ""
+    system += f"\nJurisdiction: {jurisdiction}" if jurisdiction else ""
 
     if selected_case and selected_case != "(All cases)":
         system += (
@@ -347,74 +283,44 @@ if prompt:
             "- If the user names a different case, follow the user."
         )
 
-    # Prompt refinement: case names must come from the first page of each PDF.
-    system += (
-        "\n\nCASE NAME RULE (FIRST PAGE):\n"
-        "- The main case name is always on the first page of the document.\n"
-        "- When you mention or list a case, use the exact case name as it appears on page 1.\n"
-        "- If the user asks for the main/available cases, respond ONLY with the case names (no summaries, no filenames)."
-    )
-
-    system += (
-        "\n\nJUDGES RULE (FIRST PAGE):\n"
-        "- The Coram (judges who sat) usually appears on the first page of the document.\n"
-        "- If the user asks who sat on a case (or who presided), answer ONLY from the first-page Coram/judges list.\n"
-        "- If judges are not available for a case, say so and do not guess."
-    )
-
-    system += (
-        "\n\nJUDICIAL OPINIONS / VOTES RULE (SCAN DOCUMENT):\n"
-        "- A judge’s ruling/opinion, reasoning, conclusion, vote (majority/concurring/dissent), and participation notes are usually NOT on page 1.\n"
-        "- Extract these only from retrieved text found elsewhere in the ruling (scan all retrieved sections).\n"
-        "- If the retrieved material does not contain this information, say so and ask a clarifying question."
-    )
-
-    augmented_user = prompt
+    file_search_tools = None
+    if retrieval_enabled and vector_store_id:
+        file_search_tools = [{"type": "file_search", "vector_store_ids": [vector_store_id]}]
 
     with st.chat_message("assistant"):
-        if client is None:
-            st.markdown("API key missing. Add `OPENAI_API_KEY` to your `.env`.")
-            answer = "API key missing."
-        else:
-            with st.spinner("Thinking…"):
-                resp = None
-                try:
-                    create_kwargs: dict[str, Any] = {}
-                    if file_search_tools:
-                        create_kwargs["tools"] = file_search_tools
+        with st.spinner("Thinking…"):
+            resp = None
+            try:
+                create_kwargs: dict[str, Any] = {}
+                if file_search_tools:
+                    create_kwargs["tools"] = file_search_tools
 
-                    resp = client.responses.create(
-                        model=MODEL,
-                        instructions=system,
-                        input=st.session_state.messages,
-                        temperature=0,
-                        **create_kwargs,
-                    )
-                    answer = (resp.output_text or "").strip() or "(No response text.)"
-                except Exception as e:
-                    answer = f"Request failed: {e}"
+                resp = client.responses.create(
+                    model=MODEL,
+                    instructions=system,
+                    input=st.session_state.messages,
+                    temperature=0,
+                    **create_kwargs,
+                )
+                answer = (resp.output_text or "").strip() or "(No response text.)"
+            except Exception as e:
+                answer = f"Request failed: {e}"
 
-            st.markdown(answer)
+        st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
 
-            if file_search_tools and resp is not None:
-                citations = _extract_file_citations(resp)
-                if citations:
-                    with st.expander("Sources"):
-                        for i, c in enumerate(citations, start=1):
-                            file_id = (c.get("file_id", "") or "").strip()
-                            local_rec = doc_record_by_file_id.get(file_id)
-                            remote_filename = _get_remote_filename(client, file_id) if (client and file_id) else ""
+        if resp is not None and file_search_tools:
+            citations = _extract_file_citations(resp)
+            if citations:
+                with st.expander("Sources"):
+                    for c in citations:
+                        file_id = (c.get("file_id") or "").strip()
+                        quote = (c.get("quote") or "").strip()
+                        if file_id:
+                            st.write(f"File: {file_id}")
+                        if quote:
+                            st.write(f"Quote: {quote}")
 
-                            st.markdown(f"**Source {i}**")
-                            if local_rec is not None:
-                                case_name = _case_name_from_record(local_rec)
-                                st.caption(_summarize_doc_record(local_rec))
-                                st.caption(f"filename: {local_rec.get('document_filename', '')}")
-                            elif remote_filename:
-                                st.caption(f"filename: {remote_filename}")
-                            if file_id:
-                                st.caption(f"file_id: {file_id}")
-                            if c.get("quote"):
-                                st.write(c["quote"])
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+if __name__ == "__main__":
+    main()
