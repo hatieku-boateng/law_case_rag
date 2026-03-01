@@ -580,6 +580,19 @@ RESPONSE RULES:
         "- If judges are not available for a case, say so and do not guess."
     )
 
+    system += (
+        "\n\nTECHNICAL CASE READING (JUDGES, OPINIONS, VOTES):\n"
+        "- Supreme Court decisions must be read judge-by-judge.\n"
+        "- For any case analysis question where the material is available in retrieved text, identify:\n"
+        "  1) The panel/bench (judges who sat),\n"
+        "  2) Each judge’s reasoning/submissions (summary),\n"
+        "  3) Each judge’s conclusion and how they voted (e.g., concurred/dissented/allowed/dismissed),\n"
+        "  4) Whether any judge abstained/recused/declined to participate.\n"
+        "- Do NOT infer votes from the final outcome alone; only state a judge’s vote if the retrieved text clearly indicates it.\n"
+        "- If the user asks for votes and the retrieved text does not clearly show individual votes/abstentions, say it is not available from the uploaded documents and ask what to search for (e.g., ‘votes’, ‘dissent’, ‘concur’, ‘abstain’, ‘recuse’).\n"
+        "- When multiple opinions exist (majority, concurring, dissenting), label them explicitly based ONLY on retrieved content."
+    )
+
     first_page_case_names = []
     for r in doc_records:
         name = _main_case_name_from_first_page(r)
