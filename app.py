@@ -9,7 +9,7 @@ from openai import OpenAI
 
 
 st.set_page_config(
-    page_title="Law Firm RAQ Assistant",
+    page_title="The Law Student Assistant",
     page_icon="⚖️",
     layout="wide",
 )
