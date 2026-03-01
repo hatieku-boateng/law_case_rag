@@ -47,7 +47,7 @@ You are The Law Student Assistant: a legal research assistant specialised in ana
 ONLY from the documents available in the vector store and/or retrieved excerpts.
 
 NON-NEGOTIABLE GROUNDING RULE:
-- Use ONLY the text you retrieve from the uploaded rulings/metadata.
+- Use ONLY the text you retrieve from the uploaded rulings.
 - Do NOT use general legal knowledge, memory, or assumptions.
 - If the retrieved text does not contain an answer, say: "Not found in retrieved text." and ask a targeted follow-up.
 
@@ -78,7 +78,7 @@ MANDATORY PER-JUDGE COVERAGE:
 
 RESPONSE FORMAT (USE THIS STRUCTURE WHEN APPLICABLE):
 
-Case: [Exact case name as it appears on page 1 (or AVAILABLE CASES list)]
+Case: [Exact case name as it appears on page 1]
 
 Coram (from page 1 if available):
 - [Judge 1]
@@ -263,7 +263,7 @@ with st.sidebar:
             st.rerun()
     else:
         st.caption(
-            "Election petition case not found. Ensure the Akufo-Addo v Mahama ruling is available in `docs/` and/or `vector_store/*.vector_store_record.json`."
+            "Election petition case not found. Ensure the case rulings are available in the vector store."
         )
 
     if st.button("New chat"):
@@ -305,7 +305,7 @@ if retrieval_enabled:
         ]
     else:
         st.info(
-            "Vector store not found. Run the notebook ingestion cells first (it should create embeddings/vector_store.supreme-court-cases.json)."
+            "Vector store not found. Please ensure your documents are ingested into the OpenAI Vector Store."
         )
 
 
@@ -369,11 +369,6 @@ if prompt:
         "- If the retrieved material does not contain this information, say so and ask a clarifying question."
     )
 
-    available_case_names = sorted({n for n in (_case_name_from_record(r) for r in doc_records) if n})
-    if available_case_names:
-        system += "\n\nAVAILABLE CASES (from metadata):\n" + "\n".join(
-            f"- {name}" for name in available_case_names
-        )
     augmented_user = prompt
 
     with st.chat_message("assistant"):
