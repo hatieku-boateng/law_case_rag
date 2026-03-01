@@ -15,6 +15,21 @@ st.set_page_config(
     layout="wide",
 )
 
+# Chat layout: user messages on the right, assistant on the left.
+st.markdown(
+        """
+<style>
+    div[data-testid="stChatMessage"]:has(.user-msg-marker) {
+        flex-direction: row-reverse;
+    }
+    div[data-testid="stChatMessage"]:has(.user-msg-marker) div[data-testid="stChatMessageContent"] {
+        text-align: right;
+    }
+</style>
+""",
+        unsafe_allow_html=True,
+)
+
 def _mask_key(key: str) -> str:
     if not key:
         return "(missing)"
@@ -467,11 +482,19 @@ if retrieval_enabled:
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        if msg["role"] == "user":
+            st.markdown('<span class="user-msg-marker"></span>', unsafe_allow_html=True)
 
 
 prompt = st.chat_input("Ask a question about your matter…")
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
+
+    # Render the just-submitted user message immediately.
+    # The chat history above was rendered before we appended this prompt.
+    with st.chat_message("user"):
+        st.markdown(prompt)
+        st.markdown('<span class="user-msg-marker"></span>', unsafe_allow_html=True)
 
     intake_bits = []
     if practice_area:
