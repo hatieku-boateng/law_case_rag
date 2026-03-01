@@ -437,8 +437,15 @@ def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str
     text = re.sub(r"\r\n?", "\n", full_text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Build positions of judge headings if present (common pattern: "NAME, JSC" etc).
-    headings: list[tuple[int, int, str]] = []
+    # Find likely start positions for each judge's opinion/ruling section.
+    # Avoid grabbing the coram/front-matter occurrence by preferring contexts like:
+    # "RULING/JUDGMENT/OPINION ... BY/DELIVERED BY ... [JUDGE]".
+    header_cue_re = re.compile(
+        r"\b(ruling|judg(e)?ment|opinion|delivered\s+by|by\s+his\s+lordship|by\s+her\s+ladyship)\b",
+        flags=re.IGNORECASE,
+    )
+
+    judge_starts: list[tuple[int, int, str]] = []
     for judge in judges:
         j_norm = re.sub(r"\s+", " ", judge).strip()
         surname = re.split(r"[,\s]", j_norm, maxsplit=1)[0]
@@ -450,23 +457,52 @@ def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str
         if surname and len(surname) >= 3:
             pats.append(re.escape(surname) + r".{0,40}?(?:JSC|CJ|AG\.?\s*CJ|JA)\b")
 
+        best: tuple[int, Optional[tuple[int, int]]] = (-10_000, None)
         for pat in pats:
-            m = re.search(pat, text, flags=re.IGNORECASE)
-            if m:
-                headings.append((m.start(), m.end(), judge))
-                break
+            for m in re.finditer(pat, text, flags=re.IGNORECASE):
+                s, e = m.start(), m.end()
+                # Score this occurrence.
+                score = 0
+                before = text[max(0, s - 120) : s]
+                after = text[e : min(len(text), e + 400)]
 
-    headings = sorted(headings, key=lambda x: x[0])
-    # De-dup by judge (keep earliest heading).
-    seen_j: set[str] = set()
-    unique: list[tuple[int, int, str]] = []
-    for s, e, j in headings:
+                if header_cue_re.search(before) or header_cue_re.search(after):
+                    score += 6
+                if re.search(r"\b(ruling|judg(e)?ment)\b\s*(?:of|by)\b", before, flags=re.IGNORECASE):
+                    score += 6
+                if re.search(r"\b(delivered\s+by)\b", before, flags=re.IGNORECASE):
+                    score += 6
+
+                # Penalize very-early matches (often coram/front matter).
+                if s < 2500:
+                    score -= 4
+
+                # Prefer matches that appear as a standalone heading line.
+                line_start = text.rfind("\n", 0, s) + 1
+                line_end = text.find("\n", e)
+                if line_end == -1:
+                    line_end = min(len(text), e + 120)
+                line = text[line_start:line_end]
+                if len(line.strip()) <= 90 and re.search(r"\b(JSC|CJ|JA)\b", line, flags=re.IGNORECASE):
+                    score += 2
+
+                if score > best[0]:
+                    best = (score, (s, e))
+
+        if best[1] is not None:
+            s, e = best[1]
+            judge_starts.append((s, e, judge))
+
+    # Sort and de-dup starts.
+    judge_starts = sorted(judge_starts, key=lambda x: x[0])
+    seen: set[str] = set()
+    headings: list[tuple[int, int, str]] = []
+    for s, e, j in judge_starts:
         key = j.lower()
-        if key in seen_j:
+        if key in seen:
             continue
-        seen_j.add(key)
-        unique.append((s, e, j))
-    headings = unique
+        seen.add(key)
+        headings.append((s, e, j))
 
     def _classify(snippet: str) -> tuple[str, str]:
         seg = re.sub(r"\s+", " ", snippet).strip()
@@ -476,6 +512,8 @@ def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str
             return ("Dissenting", seg)
         if re.search(r"\bconcurring\b|\bconcur\b", seg, flags=re.IGNORECASE):
             return ("Concurring", seg)
+        if re.search(r"\bI\s+(?:fully\s+)?agree\b.{0,120}\b(dismiss|allowed?)\b", seg, flags=re.IGNORECASE):
+            return ("Agrees (explicit)", seg)
         if re.search(
             r"\bI\s+would\s+dismiss\b|\bI\s+dismiss\b|\bthe\s+appeal\s+is\s+dismissed\b",
             seg,
@@ -491,17 +529,34 @@ def _extract_votes_from_full_text(full_text: str, judges: list[str]) -> dict[str
         return ("", "")
 
     def _extract_submission(window: str) -> str:
-        w = re.sub(r"\s+", " ", window).strip()
+        # Keep line breaks for heading detection, but normalize excessive whitespace.
+        w = re.sub(r"\t+", " ", window)
+        w = re.sub(r"[ ]{2,}", " ", w)
+        w = re.sub(r"\n{3,}", "\n\n", w)
+        w = w.strip()
         if not w:
             return ""
+
+        # Prefer content under a RULING/JUDGMENT heading if present.
+        m_head = re.search(r"\b(ruling|judg(e)?ment|judgement)\b", w, flags=re.IGNORECASE)
+        if m_head:
+            start = m_head.start()
+            w2 = w[start : start + 5000]
+        else:
+            w2 = w[:5000]
+
+        # Extract a meaningful excerpt (not just the heading line).
+        w2_one = re.sub(r"\s+", " ", w2).strip()
         m = re.search(
-            r"(.{0,80}?(?:I\s+(?:have\s+)?(?:read|consider)|in\s+my\s+view|I\s+am\s+of\s+the\s+opinion|I\s+hold|I\s+think|I\s+agree|I\s+dissent).{0,420})",
-            w,
+            r"(.{0,120}?(?:I\s+(?:have\s+)?(?:read|consider)|in\s+my\s+view|I\s+am\s+of\s+the\s+opinion|I\s+hold|I\s+think|I\s+agree|I\s+dissent).{0,520})",
+            w2_one,
             flags=re.IGNORECASE,
         )
         if m:
             return re.sub(r"\s+", " ", m.group(1)).strip()
-        return w[:520].strip()
+
+        # Fallback: take the first substantial excerpt beyond any short heading.
+        return w2_one[:700].strip()
 
     results: dict[str, dict[str, str]] = {}
 
