@@ -12,8 +12,8 @@ __pycache__/
 embeddings/
 vector_store/
 
-# Source PDFs (keep out of git by default)
-docs/*.pdf
+# Source PDFs
+# (Committed so Streamlit Cloud can read first-page case names)
 
 # OS
 .DS_Store

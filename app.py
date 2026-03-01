@@ -124,6 +124,24 @@ def _extract_first_page_text(pdf_path: str, doc_sha256: str = "") -> str:
         return ""
 
 
+def _discover_local_pdfs() -> list[Path]:
+    docs_dir = Path(__file__).parent / "docs"
+    if not docs_dir.exists() or not docs_dir.is_dir():
+        return []
+    return sorted(docs_dir.glob("*.pdf"))
+
+
+@st.cache_data(show_spinner=False)
+def _case_names_from_local_pdfs(_cache_buster: str = "") -> list[str]:
+    names: list[str] = []
+    for pdf_path in _discover_local_pdfs():
+        text = _extract_first_page_text(str(pdf_path), doc_sha256="")
+        name = _case_name_from_first_page_text(text)
+        if name:
+            names.append(name)
+    return sorted(set(names))
+
+
 def _case_name_from_first_page_text(text: str) -> str:
     if not text:
         return ""
@@ -382,6 +400,10 @@ RESPONSE RULES:
         if name:
             first_page_case_names.append(name)
 
+    # Also derive names directly from local PDFs (helps on Streamlit Cloud if vector_store/*.json
+    # or vector store tools aren't available).
+    first_page_case_names.extend(_case_names_from_local_pdfs())
+
     first_page_case_names = sorted(set(first_page_case_names))
     if first_page_case_names:
         system += "\n\nAVAILABLE CASES (from first page):\n" + "\n".join(
@@ -390,8 +412,15 @@ RESPONSE RULES:
 
     # Deterministic handling: deployed models can occasionally drift on instruction-following.
     # For case-list queries, return the first-page-derived case names directly.
-    if _is_case_list_query(prompt) and first_page_case_names:
-        answer = "\n".join(f"- {name}" for name in first_page_case_names)
+    if _is_case_list_query(prompt):
+        if first_page_case_names:
+            answer = "\n".join(f"- {name}" for name in first_page_case_names)
+        else:
+            answer = (
+                "No cases are available on this deployment. "
+                "Ensure your PDFs are committed under the `docs/` folder (e.g., `docs/doc_1.pdf`, `docs/doc_2.pdf`) "
+                "and/or that `vector_store/*.vector_store_record.json` exists."
+            )
         with st.chat_message("assistant"):
             st.markdown(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
