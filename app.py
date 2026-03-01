@@ -103,6 +103,15 @@ def _summarize_doc_record(rec: dict[str, Any]) -> str:
     return " — ".join(bits) if bits else "(metadata not available)"
 
 
+def _case_name_from_record(rec: dict[str, Any]) -> str:
+    meta = rec.get("metadata") or {}
+    title = (meta.get("title") or "").strip()
+    if title:
+        return title
+    filename = (rec.get("document_filename") or rec.get("filename") or "").strip()
+    return filename
+
+
 def _get_remote_filename(client: OpenAI, file_id: str) -> str:
     try:
         fobj = client.files.retrieve(file_id)
@@ -214,6 +223,10 @@ RESPONSE RULES:
 5. If the user asks: "What cases do you have?"
     Respond ONLY with the names of the available cases based on file metadata.
     Do NOT summarise or describe them.
+    Treat the following as the same request and respond the same way:
+    - "What are the main cases?"
+    - "List the available cases"
+    - "Which cases are in the vector store / uploaded documents?"
 
 6. Do NOT fabricate:
     - case names
@@ -230,6 +243,12 @@ RESPONSE RULES:
 """.strip()
     if intake_bits:
         system += "\n\n" + "\n".join(intake_bits)
+
+    available_case_names = sorted({n for n in (_case_name_from_record(r) for r in doc_records) if n})
+    if available_case_names:
+        system += "\n\nAVAILABLE CASES (from metadata):\n" + "\n".join(
+            f"- {name}" for name in available_case_names
+        )
     augmented_user = prompt
 
     with st.chat_message("assistant"):
@@ -238,7 +257,12 @@ RESPONSE RULES:
             answer = "API key missing."
         else:
             with st.spinner("Thinking…"):
+                resp = None
                 try:
+                    create_kwargs: dict[str, Any] = {}
+                    if file_search_tools:
+                        create_kwargs["tools"] = file_search_tools
+
                     resp = client.responses.create(
                         model=MODEL,
                         input=[
@@ -246,7 +270,7 @@ RESPONSE RULES:
                             *st.session_state.messages[:-1],
                             {"role": "user", "content": augmented_user},
                         ],
-                        tools=file_search_tools,
+                        **create_kwargs,
                     )
                     answer = (resp.output_text or "").strip() or "(No response text.)"
                 except Exception as e:
@@ -254,7 +278,7 @@ RESPONSE RULES:
 
             st.markdown(answer)
 
-            if file_search_tools:
+            if file_search_tools and resp is not None:
                 citations = _extract_file_citations(resp)
                 if citations:
                     with st.expander("Sources"):
