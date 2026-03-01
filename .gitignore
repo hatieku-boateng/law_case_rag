@@ -10,7 +10,9 @@ __pycache__/
 
 # Generated artifacts / local state
 embeddings/
-vector_store/
+# Keep vector store records (small JSON metadata) for deployments
+vector_store/*
+!vector_store/*.vector_store_record.json
 
 # Source PDFs
 # (Committed so Streamlit Cloud can read first-page case names)

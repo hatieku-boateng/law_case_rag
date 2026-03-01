@@ -131,11 +131,32 @@ def _discover_local_pdfs() -> list[Path]:
     return sorted(docs_dir.glob("*.pdf"))
 
 
+def _local_pdf_manifest() -> str:
+    """A stable string that changes when docs PDFs change.
+
+    Used to bust Streamlit caches on deploys/updates.
+    """
+    parts: list[str] = []
+    for p in _discover_local_pdfs():
+        try:
+            st_ = p.stat()
+            parts.append(f"{p.name}:{st_.st_size}:{st_.st_mtime_ns}")
+        except Exception:
+            parts.append(f"{p.name}:?")
+    return "|".join(parts)
+
+
 @st.cache_data(show_spinner=False)
 def _case_names_from_local_pdfs(_cache_buster: str = "") -> list[str]:
     names: list[str] = []
     for pdf_path in _discover_local_pdfs():
-        text = _extract_first_page_text(str(pdf_path), doc_sha256="")
+        # Include file stats to avoid stale cache when PDFs are updated.
+        try:
+            st_ = pdf_path.stat()
+            sig = f"{st_.st_size}:{st_.st_mtime_ns}"
+        except Exception:
+            sig = ""
+        text = _extract_first_page_text(str(pdf_path), doc_sha256=sig)
         name = _case_name_from_first_page_text(text)
         if name:
             names.append(name)
@@ -214,7 +235,19 @@ def _main_case_name_from_first_page(rec: dict[str, Any]) -> str:
         # Try resolving relative to workspace root.
         pdf_path = Path(__file__).parent / Path(str(doc_path).replace("\\", os.sep))
     text = _extract_first_page_text(str(pdf_path), (rec.get("document_sha256") or "").strip())
-    return _case_name_from_first_page_text(text)
+
+    extracted = _case_name_from_first_page_text(text)
+
+    # If metadata title is present on page 1, prefer it (cleaner formatting) while
+    # still honoring the "first page" rule.
+    meta_title = ((rec.get("metadata") or {}).get("title") or "").strip()
+    if meta_title and text:
+        hay = re.sub(r"\s+", " ", text).lower()
+        needle = re.sub(r"\s+", " ", meta_title).lower()
+        if needle and needle in hay:
+            return meta_title
+
+    return extracted
 
 
 def _summarize_doc_record_with_case_name(rec: dict[str, Any], case_name: str) -> str:
@@ -402,7 +435,7 @@ RESPONSE RULES:
 
     # Also derive names directly from local PDFs (helps on Streamlit Cloud if vector_store/*.json
     # or vector store tools aren't available).
-    first_page_case_names.extend(_case_names_from_local_pdfs())
+    first_page_case_names.extend(_case_names_from_local_pdfs(_local_pdf_manifest()))
 
     first_page_case_names = sorted(set(first_page_case_names))
     if first_page_case_names:
