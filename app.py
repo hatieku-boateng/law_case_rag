@@ -353,6 +353,25 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 
+doc_records = _load_all_doc_records()
+doc_record_by_file_id = {
+    (r.get("file_id") or "").strip(): r for r in doc_records if (r.get("file_id") or "").strip()
+}
+
+sidebar_case_names = sorted(
+    set(
+        [
+            n
+            for n in (
+                _case_names_from_local_pdfs(_local_pdf_manifest())
+                + [_main_case_name_from_first_page(r) for r in doc_records]
+            )
+            if n
+        ]
+    )
+)
+
+
 with st.sidebar:
     practice_area = st.selectbox(
         "Practice area",
@@ -365,6 +384,12 @@ with st.sidebar:
     jurisdiction = st.selectbox("Jurisdiction", ["Ghana"], index=0)
 
     st.divider()
+
+    st.markdown("**Cases in the database**")
+    if sidebar_case_names:
+        st.markdown("\n".join(f"- {name}" for name in sidebar_case_names))
+    else:
+        st.caption("No cases found. Add PDFs under the docs folder and/or add vector_store record JSON files.")
 
     if st.button("New chat"):
         st.session_state.messages = []
@@ -390,11 +415,6 @@ vector_store_id = (vector_store_record or {}).get("vector_store_id") if vector_s
 if not vector_store_id and client is not None:
     vector_store_id = _find_vector_store_id_by_name(client, VECTOR_STORE_NAME)
 retrieval_enabled = True
-
-doc_records = _load_all_doc_records()
-doc_record_by_file_id = {
-    (r.get("file_id") or "").strip(): r for r in doc_records if (r.get("file_id") or "").strip()
-}
 
 file_search_tools = None
 if retrieval_enabled:
